@@ -8,7 +8,8 @@
 # Usage: sh contrib/fast-vm/run-x86-fast.sh -kernel K -initrd I [-append EXTRA] [-m MB]
 # Env overrides: QEMU_BIN.
 set -u
-QEMU_BIN=${QEMU_BIN:-/Users/ahmed/qemu-dbc-jit/build/qemu-system-x86_64}
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+QEMU_BIN=${QEMU_BIN:-$REPO_ROOT/build/qemu-system-x86_64}
 KERNEL=""; INITRD=""; EXTRA=""; MEM=1024
 while [ $# -gt 0 ]; do
     case $1 in

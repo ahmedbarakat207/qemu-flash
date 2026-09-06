@@ -1,4 +1,4 @@
-# qemu-dbc-jit: a faster TCG fork for non-KVM x86_64-on-ARM64
+# qemu-flash: a faster TCG fork for non-KVM x86_64-on-ARM64
 
 Fork of QEMU 11.x (upstream `README.rst` still applies) focused on one
 thing: making TCG system emulation of x86_64 guests on ARM64 hosts

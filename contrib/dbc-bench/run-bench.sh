@@ -6,7 +6,8 @@
 # Usage: ./run-bench.sh [patched-qemu] [stock-qemu] [runs]
 set -u
 
-PATCHED=${1:-/Users/ahmed/qemu-dbc-jit/build/qemu-system-x86_64}
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+PATCHED=${1:-$REPO_ROOT/build/qemu-system-x86_64}
 STOCK=${2:-/opt/homebrew/bin/qemu-system-x86_64}
 RUNS=${3:-5}
 KERNEL=$(dirname "$0")/kernel.elf
