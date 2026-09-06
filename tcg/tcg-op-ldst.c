@@ -116,6 +116,19 @@ static void gen_st_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)
 
 static void tcg_gen_req_mo(TCGBar type)
 {
+    /*
+     * In serial mode, reduce ordering: the MO-upgrade fences below only
+     * order this thread's accesses against other threads.  With a single
+     * vCPU thread (CF_PARALLEL clear) there are no concurrent observers
+     * of guest RAM that need it -- device/DMA paths are serialized with
+     * the vCPU -- so program order is observed without the fences.
+     * This mirrors the serial-mode atomicity reduction in
+     * tcg_canonicalize_memop().  Explicit guest barriers (mfence,
+     * locked ops) bypass this helper and keep full fencing.
+     */
+    if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {
+        return;
+    }
     type &= tcg_ctx->guest_mo;
     type &= ~TCG_TARGET_DEFAULT_MO;
     if (type) {

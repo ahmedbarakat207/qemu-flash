@@ -105,6 +105,7 @@ struct tb_tree_stats {
     size_t direct_jmp_count;
     size_t direct_jmp2_count;
     size_t cross_page;
+    size_t chained;
 };
 
 static gboolean tb_tree_stats_iter(gpointer key, gpointer value, gpointer data)
@@ -128,6 +129,16 @@ static gboolean tb_tree_stats_iter(gpointer key, gpointer value, gpointer data)
         if (tb->jmp_reset_offset[1] != TB_JMP_OFFSET_INVALID) {
             tst->direct_jmp2_count++;
         }
+    }
+    /*
+     * An outgoing slot with any non-NULL value (masking the
+     * invalidation poison bit) means a direct edge was chained at
+     * least once.  Best effort: read without the jump locks, same
+     * as the other fields above.
+     */
+    if ((qatomic_read(&tb->jmp_dest[0]) & ~(uintptr_t)1) ||
+        (qatomic_read(&tb->jmp_dest[1]) & ~(uintptr_t)1)) {
+        tst->chained++;
     }
     return false;
 }
@@ -197,6 +208,17 @@ static void dump_exec_info(GString *buf)
                            nb_tbs ? (tst.direct_jmp_count * 100) / nb_tbs : 0,
                            tst.direct_jmp2_count,
                            nb_tbs ? (tst.direct_jmp2_count * 100) / nb_tbs : 0);
+    g_string_append_printf(buf, "chained TB count    %zu (%zu%%)\n",
+                           tst.chained,
+                           nb_tbs ? (tst.chained * 100) / nb_tbs : 0);
+
+    g_string_append_printf(buf, "\nDirect chaining:\n");
+    g_string_append_printf(buf, "TB links patched    %u\n",
+                           qatomic_read(&tb_ctx.tb_link_count));
+    g_string_append_printf(buf, "TB links skipped    %u (slot already claimed)\n",
+                           qatomic_read(&tb_ctx.tb_link_skipped));
+    g_string_append_printf(buf, "TB links invalid    %u (dest invalidated)\n",
+                           qatomic_read(&tb_ctx.tb_link_invalid));
 
     qht_statistics_init(&tb_ctx.htable, &hst);
     print_qht_statistics(hst, buf);

@@ -35,6 +35,19 @@ struct TBContext {
     /* statistics */
     unsigned tb_flush_count;
     unsigned tb_phys_invalidate_count;
+
+    /*
+     * Direct block chaining (tb_add_jump) statistics.
+     * tb_link_count: outgoing edges successfully patched to jump
+     * directly to the destination TB.
+     * tb_link_skipped: chaining attempts skipped because the slot
+     * was already claimed (steady-state chained execution).
+     * tb_link_invalid: attempts dropped because the destination TB
+     * was already invalidated.
+     */
+    unsigned tb_link_count;
+    unsigned tb_link_skipped;
+    unsigned tb_link_invalid;
 };
 
 extern TBContext tb_ctx;

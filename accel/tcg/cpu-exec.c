@@ -621,18 +621,36 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 {
     uintptr_t old;
 
-    qemu_thread_jit_write();
     assert(n < ARRAY_SIZE(tb->jmp_list_next));
+
+    /*
+     * Fast path: the slot is already claimed, so no new link can be
+     * installed here (linked TB, poisoned slot under invalidation with
+     * the LSB set, or an unlinked slot).  Skip the MAP_JIT write-toggle
+     * (a syscall-class operation on Darwin) and the destination
+     * spinlock: the cmpxchg below would fail and reach the same
+     * conclusion.  This triggers on link conflicts (e.g. concurrent
+     * MTTCG patch attempts) and on attempts to relink poisoned slots.
+     */
+    old = qatomic_read(&tb->jmp_dest[n]);
+    if (old != (uintptr_t)NULL) {
+        qatomic_inc(&tb_ctx.tb_link_skipped);
+        return;
+    }
+
+    qemu_thread_jit_write();
     qemu_spin_lock(&tb_next->jmp_lock);
 
     /* make sure the destination TB is valid */
     if (tb_next->cflags & CF_INVALID) {
+        qatomic_inc(&tb_ctx.tb_link_invalid);
         goto out_unlock_next;
     }
     /* Atomically claim the jump destination slot only if it was NULL */
     old = qatomic_cmpxchg(&tb->jmp_dest[n], (uintptr_t)NULL,
                           (uintptr_t)tb_next);
     if (old) {
+        qatomic_inc(&tb_ctx.tb_link_skipped);
         goto out_unlock_next;
     }
 
@@ -645,6 +663,8 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 
     qemu_spin_unlock(&tb_next->jmp_lock);
 
+    qatomic_inc(&tb_ctx.tb_link_count);
+    trace_link_tb(tb, n, tb_next);
     qemu_log_mask(CPU_LOG_EXEC, "Linking TBs %p index %d -> %p\n",
                   tb->tc.ptr, n, tb_next->tc.ptr);
     return;

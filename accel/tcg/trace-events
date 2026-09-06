@@ -5,6 +5,7 @@
 exec_tb(void *tb, uintptr_t pc) "tb:%p pc=0x%"PRIxPTR
 exec_tb_nocache(void *tb, uintptr_t pc) "tb:%p pc=0x%"PRIxPTR
 exec_tb_exit(void *last_tb, unsigned int flags) "tb:%p flags=0x%x"
+link_tb(void *tb, int n, void *tb_next) "tb:%p index %d -> tb:%p"
 
 # cputlb.c
 memory_notdirty_write_access(uint64_t vaddr, uint64_t ram_addr, unsigned size) "0x%" PRIx64 " ram_addr 0x%" PRIx64 " size %u"

@@ -26,6 +26,10 @@
 #include "tcg/tcg.h"
 #include "tcg-has.h"
 
+#ifdef __APPLE__
+__thread bool qemu_jit_write_state;
+#endif
+
 const TCGOpDef tcg_op_defs[] = {
 #define DEF(s, oargs, iargs, cargs, flags) \
          { #s, oargs, iargs, cargs, iargs + oargs + cargs, flags },
