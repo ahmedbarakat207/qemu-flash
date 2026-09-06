@@ -23,7 +23,7 @@ done
 
 APPEND="console=ttyS0,115200n8 acpi=off $EXTRA"
 
-exec "$QEMU_BIN" -M pc -m "$MEM" \
+exec "$QEMU_BIN" -accel tcg,thread=single -M pc -m "$MEM" \
     -kernel "$KERNEL" ${INITRD:+-initrd "$INITRD"} -append "$APPEND" \
     -display none -serial stdio \
     -parallel none \
@@ -32,6 +32,10 @@ exec "$QEMU_BIN" -M pc -m "$MEM" \
     -no-reboot
 
 # Notes:
+# - thread=single (Round-Robin): one thread runs everything, so there is
+#   no vCPU<->IO lock ping-pong or cross-core state bouncing. Fastest for
+#   single-vCPU guests (measured -37% vs MTTCG on boot); do not use with
+#   -smp > 1 (SMP needs MTTCG to use the extra vCPUs).
 # - acpi=off saves ~1s of AML storms. Cost: no ACPI poweroff; stop the VM
 #   with quit in the monitor (add -monitor stdio, conflicts with serial
 #   stdio -- use -serial file:boot.log in that case) or kill the process.

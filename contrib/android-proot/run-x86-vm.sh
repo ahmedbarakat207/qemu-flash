@@ -17,7 +17,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$KERNEL" ] || { echo "need -kernel" >&2; exit 1; }
 
-exec "$QEMU" -M pc -m "$MEM" \
+exec "$QEMU" -accel tcg,thread=single -M pc -m "$MEM" \
     -kernel "$KERNEL" ${INITRD:+-initrd "$INITRD"} -append "$APPEND" \
     -display none -serial stdio \
     -parallel none \
@@ -27,6 +27,8 @@ exec "$QEMU" -M pc -m "$MEM" \
     -no-reboot
 
 # Notes:
+# - thread=single (Round-Robin) removes all vCPU<->IO lock contention;
+#   fastest for single-vCPU guests. Drop it (use MTTCG default) for -smp > 1.
 # - x86_64 Linux APPS (not a full OS) run far faster via linux-user, no VM:
 #     build/qemu-x86_64 ./your-x86_64-binary
 #   (needs x86_64 dynamic loader + libs reachable via -L /path/to/sysroot)
