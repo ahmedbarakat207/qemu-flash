@@ -932,3 +932,7 @@ int qemu_ftruncate64(int fd, int64_t length)
     SetFilePointer(h, li.LowPart, &li.HighPart, FILE_BEGIN);
     return res ? 0 : -1;
 }
+
+void os_setup_cpu_affinity(void)
+{
+}

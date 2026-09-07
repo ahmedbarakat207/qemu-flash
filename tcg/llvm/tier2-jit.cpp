@@ -32,19 +32,31 @@
 #include <vector>
 #include <array>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <ctime>
+#include <unistd.h>
 
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+#include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
+#include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/TargetParser/Host.h"
+#include <sys/stat.h>
 
 using namespace llvm;
 using namespace llvm::orc;
@@ -267,62 +279,428 @@ static Value *envPtr(IRBuilder<> &B, Value *envI8, int64_t off)
     return B.CreateBitCast(p8, PointerType::get(B.getContext(), 0));
 }
 
+static const char *t2opname(unsigned op)
+{
+    switch (op) {
+    case T2_MOV: return "mov";
+    case T2_ADD: return "add";
+    case T2_SUB: return "sub";
+    case T2_MUL: return "mul";
+    case T2_AND: return "and";
+    case T2_OR: return "or";
+    case T2_XOR: return "xor";
+    case T2_NEG: return "neg";
+    case T2_NOT: return "not";
+    case T2_SHL: return "shl";
+    case T2_SHR: return "shr";
+    case T2_SAR: return "sar";
+    case T2_ROTL: return "rotl";
+    case T2_ROTR: return "rotr";
+    case T2_EXTRACT: return "extract";
+    case T2_SEXTRACT: return "sextract";
+    case T2_DEPOSIT: return "deposit";
+    case T2_EXT32U: return "ext32u";
+    case T2_EXT32S: return "ext32s";
+    case T2_EXTRL: return "extrl";
+    case T2_SETCOND: return "setcond";
+    case T2_MOVCOND: return "movcond";
+    case T2_BR: return "br";
+    case T2_BRCOND: return "brcond";
+    case T2_SETLABEL: return "setlabel";
+    case T2_EXIT_TB: return "exit_tb";
+    case T2_GOTO_TB: return "goto_tb";
+    case T2_GOTO_PTR: return "goto_ptr";
+    case T2_LD8U: return "ld8u";
+    case T2_LD8S: return "ld8s";
+    case T2_LD16U: return "ld16u";
+    case T2_LD16S: return "ld16s";
+    case T2_LD32U: return "ld32u";
+    case T2_LD32S: return "ld32s";
+    case T2_LD32: return "ld32";
+    case T2_LD64: return "ld64";
+    case T2_ST8: return "st8";
+    case T2_ST16: return "st16";
+    case T2_ST32: return "st32";
+    case T2_ST64: return "st64";
+    case T2_QEMU_LD: return "qemu_ld";
+    case T2_QEMU_ST: return "qemu_st";
+    case T2_CALL: return "call";
+    case T2_BSWAP16: return "bswap16";
+    case T2_BSWAP32: return "bswap32";
+    case T2_BSWAP64: return "bswap64";
+    case T2_NEGSETCOND: return "negsetcond";
+    default: return "unsupported";
+    }
+}
+
 struct WalkState {
     LLVMContext &C;
     Module *M;
     Function *F;
     Value *envI8;
-    const Tier2TBRec *rec;
     const Tier2TraceDesc *trace;
-    std::vector<Value *> slot; /* temp idx -> i64 alloca */
-    std::map<int64_t, BasicBlock *> labels;
+    /* The TB currently being emitted (recs[cur_tb]); helpers that need
+     * per-TB metadata (cflags, temps) read through this. */
+    uint32_t cur_tb = 0;
+    /*
+     * Temp cells. Env-slot globals share ONE cell per byte offset across
+     * all TBs (key {"g", off}); everything else gets a private cell per
+     * (tb, temp) (key {"l", tb<<32|temp}). Const temps get no cell; their
+     * value is materialized inline from the snapshot.
+     */
+    std::map<std::pair<uint32_t, uint64_t>, Value *> cells;
+    /* (tb, label id) -> block, plus one entry block per TB. */
+    std::map<std::pair<uint32_t, int64_t>, BasicBlock *> labels;
+    std::vector<BasicBlock *> entries;
+    /* Guest PC -> trace index (first TB wins; duplicates unresolvable). */
+    std::map<uint64_t, uint32_t> pc2idx;
+    /*
+     * Promoted env slots: byte offset -> commit width (widest temp view
+     * across the trace). Every env-slot temp in every TB shares the
+     * cell for its offset; defs update cells only, and commitEnv()
+     * flushes cells to env at side exits and around calls. Between
+     * those points guest state lives in SSA values (mem2reg promotes
+     * the allocas), which is the entire performance point of fusion.
+     */
+    std::map<int32_t, unsigned> envWidths;
+    /*
+     * Env offsets ever defined (temp DST, including LD DSTs) in reachable
+     * TBs. Commit points flush exactly this set: init-only slots always
+     * equal env (nothing wrote the cell ahead), so committing them is
+     * pure waste. Reload stays wide (helpers can write slots we never
+     * defined; a later LD must see those writes, and LD commits only
+     * defined slots -- see the LD case).
+     */
+    std::set<int32_t> definedSet;
     Type *I64 = nullptr;
     bool dead = false; /* set after an unconditional terminator; ops are
                         * skipped until the next SETLABEL (unreachable in
                         * TCG too, so skipping is faithful) */
+    bool debug = false;
 };
 
-static bool tempOk(const Tier2TBRec *rec, int32_t t)
+static const Tier2TBRec *curRec(const WalkState &S)
 {
+    return &S.trace->recs[S.cur_tb];
+}
+
+static bool tempOk(const WalkState &S, uint32_t tb, int32_t t)
+{
+    if (tb >= S.trace->num_tbs) {
+        return false;
+    }
+    const Tier2TBRec *rec = &S.trace->recs[tb];
     if (t < 0 || (uint32_t)t >= rec->num_temps) {
         return false;
     }
     /* env_off == -2: non-env global base (unsupported base).
      * is_env: the env pointer marker itself; never a value. */
-    return rec->temps[t].env_off != -2 && !rec->temps[t].is_env;
+    if (rec->temps[t].env_off == -2 || rec->temps[t].is_env) {
+        if (S.debug) {
+            fprintf(stderr, "[tier2-jit] temp reject tb=%u t=%d (env_off=%d is_env=%d)\n",
+                    tb, t, rec->temps[t].env_off, rec->temps[t].is_env);
+        }
+        return false;
+    }
+    return true;
 }
 
-static Value *useTemp(IRBuilder<> &B, WalkState &S, int32_t t, bool &ok)
+static std::pair<uint32_t, uint64_t> cellKey(const WalkState &S, uint32_t tb,
+                                             int32_t t)
 {
-    if (!tempOk(S.rec, t)) {
+    const Tier2TempRec &tr = S.trace->recs[tb].temps[t];
+    if (tr.env_off >= 0) {
+        return {0xFFFFFFFFu, (uint64_t)(uint32_t)tr.env_off};
+    }
+    return {tb, (uint64_t)(uint32_t)t};
+}
+
+static Value *useTemp(IRBuilder<> &B, WalkState &S, uint32_t tb, int32_t t,
+                      bool &ok)
+{
+    if (tb >= S.trace->num_tbs) {
         ok = false;
         return nullptr;
     }
-    return B.CreateLoad(S.I64, S.slot[t]);
+    const Tier2TBRec *rec = &S.trace->recs[tb];
+    if (t < 0 || (uint32_t)t >= rec->num_temps) {
+        ok = false;
+        return nullptr;
+    }
+    const Tier2TempRec &tr = rec->temps[t];
+    if (tr.is_env) {
+        /*
+         * The env base itself as a value (e.g. helper env argument, or
+         * env+offset pointer arithmetic): it IS the host address of the
+         * struct, exactly what TCG keeps in its dedicated register.
+         */
+        return B.CreatePtrToInt(
+            B.CreateBitCast(S.envI8, PointerType::get(S.C, 0)), S.I64);
+    }
+    if (!tempOk(S, tb, t)) {
+        ok = false;
+        return nullptr;
+    }
+    if (tr.is_const) {
+        uint64_t v = tr.const_val;
+        if (tr.tbits == 32) {
+            v &= 0xffffffffULL;
+        }
+        return B.getInt64(v);
+    }
+    auto it = S.cells.find(cellKey(S, tb, t));
+    if (it == S.cells.end()) {
+        ok = false;
+        return nullptr;
+    }
+    Value *v = B.CreateLoad(S.I64, it->second);
+    /* Mask at use as well as def: shared env cells may hold a wider
+     * value than this view's width (mixed-width views of one slot).
+     * Masking is idempotent, so single-width streams are unaffected. */
+    return maskTo(B, v, tr.tbits == 32 ? 32 : 64);
 }
 
-/* Store cell value to temp; commit env-slot globals through the pointer. */
-static void defTemp(IRBuilder<> &B, WalkState &S, int32_t t, Value *v)
+/*
+ * Store cell value to temp. No env commit here by design: promoted
+ * globals live in cells between commit points (side exits, calls),
+ * which is what lets mem2reg lift the whole fused body into SSA.
+ */
+static void defTemp(IRBuilder<> &B, WalkState &S, uint32_t tb, int32_t t,
+                    Value *v)
 {
-    LLVMContext &C = S.C;
-    B.CreateStore(v, S.slot[t]);
-    int32_t off = S.rec->temps[t].env_off;
-    if (off >= 0) {
-        if (S.rec->temps[t].tbits == 32) {
-            Value *p = envPtr(B, S.envI8, off);
-            B.CreateStore(B.CreateTrunc(v, Type::getInt32Ty(C)), p);
-        } else {
-            Value *p = envPtr(B, S.envI8, off);
-            B.CreateStore(v, p);
-        }
+    const Tier2TempRec &tr = S.trace->recs[tb].temps[t];
+    v = maskTo(B, v, tr.tbits == 32 ? 32 : 64);
+    auto it = S.cells.find(cellKey(S, tb, t));
+    if (it != S.cells.end()) {
+        B.CreateStore(v, it->second);
     }
 }
 
-/* Emit one guest-memory op via helper_*_mmu (plan 3a). Returns false to
- * bail when the form is not supported yet (bswap, 128-bit, parallel
- * atomics, missing helper). retaddr uses the real host return address;
- * faults from JIT code have no TCG unwind info, so guest-mem stays
- * default-off until differential-tested (see tier2.c). */
+/* Flush one promoted slot (cell -> env, sized). */
+static void commitOne(IRBuilder<> &B, WalkState &S, int32_t off)
+{
+    auto cw = S.envWidths.find(off);
+    if (cw == S.envWidths.end()) {
+        return;
+    }
+    auto it = S.cells.find(std::make_pair(0xFFFFFFFFu, (uint64_t)(uint32_t)off));
+    if (it == S.cells.end()) {
+        return;
+    }
+    LLVMContext &C = S.C;
+    Value *v = B.CreateLoad(S.I64, it->second);
+    Value *p = envPtr(B, S.envI8, off);
+    if (cw->second == 32) {
+        B.CreateStore(B.CreateTrunc(v, Type::getInt32Ty(C)), p);
+    } else {
+        B.CreateStore(v, p);
+    }
+}
+
+/* Flush all promoted slots to env. Required before any side exit and
+ * around any helper call (helpers observe/mutate env through memory).
+ * Narrowed to slots ever defined in-trace: init-only slots always equal
+ * env (nothing wrote the cell ahead), so committing them is pure waste.
+ * Sound: side exits and calls are exactly the points where control may
+ * observe env outside SSA. */
+static void commitEnv(IRBuilder<> &B, WalkState &S)
+{
+    for (int32_t off : S.definedSet) {
+        commitOne(B, S, off);
+    }
+}
+
+/*
+ * Reload all promoted slots from env (env -> cell). Required after any
+ * helper call, which may have mutated guest state behind our back.
+ * Same defined-set narrowing (a slot never defined in-trace cannot have
+ * gone stale in its cell... except the helper itself may have written
+ * env directly! A helper write to a never-defined slot leaves env ahead
+ * of the init-loaded cell. Reloading the full defined set misses that
+ * case -- EXCEPT such a slot is, by definition, never read afterward
+ * through a cell... no wait, it could be: helper writes env slot X
+ * (never tracedef'd), later LD X reads env (commits nothing, LD reads
+ * env directly -- FRESH ✓) vs later temp-USE of X's temp -- temps with
+ * env slots but no defs in trace: their cells hold init values; helper
+ * mutated env; use reads stale cell. UNSOUND unless reload covers all
+ * envWidths. CONSERVATIVE: reload the full widths map. The asymmetry
+ * (narrow commit, wide reload) is the sound combination: commit needs
+ * dirty (defined), reload needs observable (anything readable).
+ */
+static void reloadEnv(IRBuilder<> &B, WalkState &S)
+{
+    LLVMContext &C = S.C;
+    for (const auto &kv : S.envWidths) {
+        int32_t off = kv.first;
+        auto it = S.cells.find(std::make_pair(0xFFFFFFFFu, (uint64_t)(uint32_t)off));
+        if (it == S.cells.end()) {
+            continue;
+        }
+        Value *p = envPtr(B, S.envI8, off);
+        Value *v;
+        if (kv.second == 32) {
+            v = B.CreateZExt(B.CreateLoad(Type::getInt32Ty(C), p), S.I64);
+        } else {
+            v = B.CreateLoad(S.I64, p);
+        }
+        B.CreateStore(v, it->second);
+    }
+}
+
+/*
+ * Guest memory: inline TLB fast path + helper slow path (Phase 3).
+ * mirror of TCG's prepare_host_addr(): same table, same comparator.
+ */
+/*
+ * Runtime externals for host-side calls. Helper addresses and the TCG
+ * prologue address are ASLR-unstable, so they are never baked as
+ * immediates: every host call goes through a named external
+ * ("helper_ldul_mmu", ..., "tier2_rt_prologue", plus per-trace helper
+ * names from tier2.c), resolved at link time via absoluteSymbols().
+ * Cached object files therefore contain only relocations, and link
+ * against whatever addresses the loading process has. This is what
+ * makes the on-disk cache sound across processes.
+ */
+static const char *memHelperName(bool isLoad, unsigned size, bool sign)
+{
+    if (!isLoad) {
+        return size == 1 ? "helper_stb_mmu"
+               : size == 2 ? "helper_stw_mmu"
+               : size == 4 ? "helper_stl_mmu"
+                           : "helper_stq_mmu";
+    }
+    if (size == 8) {
+        return "helper_ldq_mmu";
+    }
+    if (!sign) {
+        return size == 1 ? "helper_ldub_mmu"
+               : size == 2 ? "helper_lduw_mmu"
+                           : "helper_ldul_mmu";
+    }
+    return size == 1 ? "helper_ldsb_mmu"
+           : size == 2 ? "helper_ldsw_mmu"
+                       : "helper_ldsl_mmu";
+}
+
+static Function *getRuntimeFn(Module *M, const char *name, FunctionType *FT)
+{
+    return cast<Function>(M->getOrInsertFunction(name, FT).getCallee());
+}
+
+/* Look up the link name recorded for a call target address. */
+static const char *callNameFor(const Tier2TraceDesc *trace, uint64_t addr)
+{
+    for (uint32_t i = 0; i < trace->num_calls; i++) {
+        if (trace->call_addrs[i] == addr) {
+            return trace->call_names[i];
+        }
+    }
+    return nullptr;
+}
+
+static std::set<std::string> g_definedRt;
+
+static bool defineRuntimeSymbols(const Tier2TraceDesc *trace)
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_jit) {
+        return false;
+    }
+    auto define1 = [&](const char *name, void *addr) -> bool {
+        if (!addr || !g_definedRt.insert(name).second) {
+            return addr != nullptr;
+        }
+        auto sym = g_jit->mangleAndIntern(name);
+        SymbolMap sm;
+        sm.insert({sym, ExecutorSymbolDef::fromPtr(
+                            (uint8_t *)addr, JITSymbolFlags::Exported)});
+        if (auto Err = g_jit->getMainJITDylib().define(absoluteSymbols(std::move(sm)))) {
+            fprintf(stderr, "[tier2-jit] failed to define %s: %s\n", name,
+                    toString(std::move(Err)).c_str());
+            return false;
+        }
+        return true;
+    };
+    const Tier2MemHelpers &H = trace->mem_helpers;
+    const char *names[11] = {
+        "helper_ldub_mmu", "helper_ldsb_mmu", "helper_lduw_mmu",
+        "helper_ldsw_mmu", "helper_ldul_mmu", "helper_ldsl_mmu",
+        "helper_ldq_mmu", "helper_stb_mmu", "helper_stw_mmu",
+        "helper_stl_mmu", "helper_stq_mmu",
+    };
+    const void *addrs[11] = {H.ld8u, H.ld8s, H.ld16u, H.ld16s, H.ld32u,
+                             H.ld32s, H.ld64, H.st8, H.st16, H.st32, H.st64};
+    for (int i = 0; i < 11; i++) {
+        /*
+         * Missing helpers only matter if some trace calls them; defining
+         * null would poison later lookups, so skip silently here (use
+         * sites still bail on null... via slow-path helper check and
+         * call-name resolution respectively).
+         */
+        if (addrs[i] && !define1(names[i], (void *)addrs[i])) {
+            return false;
+        }
+    }
+    if (g_prologue_fn && !define1("tier2_rt_prologue", (void *)g_prologue_fn)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < trace->num_calls; i++) {
+        if (!define1(trace->call_names[i], (void *)trace->call_addrs[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static Value *emitGuestMemSlow(IRBuilder<> &B, WalkState &S,
+                               const Tier2OpRec &op, bool isLoad, Value *addr,
+                               Value *val, const char *hname)
+{
+    LLVMContext &C = S.C;
+    Type *PtrTy = PointerType::get(C, 0);
+    Type *I64 = S.I64;
+    Type *I32 = Type::getInt32Ty(C);
+    unsigned size = (unsigned)(op.imm2 & 0xff);
+    Value *retaddr = B.CreatePtrToInt(
+        B.CreateCall(Intrinsic::getOrInsertDeclaration(S.M, Intrinsic::returnaddress),
+                     {B.getInt32(0)}),
+        I64);
+    Value *envArg = B.CreateBitCast(S.envI8, PtrTy);
+    Value *oi = B.getInt32((uint32_t)op.imm1);
+    if (isLoad) {
+        FunctionType *HT = FunctionType::get(I64, {PtrTy, I64, I32, I64}, false);
+        Function *hfn = getRuntimeFn(S.M, hname, HT);
+        commitEnv(B, S);
+        Value *r = B.CreateCall(HT, hfn, {envArg, addr, oi, retaddr});
+        reloadEnv(B, S);
+        return r;
+    }
+    Type *VT = size == 8 ? I64 : (Type *)I32;
+    if (size != 8) {
+        val = B.CreateTrunc(val, I32);
+    }
+    FunctionType *HT = FunctionType::get(Type::getVoidTy(C),
+                                         {PtrTy, I64, VT, I32, I64}, false);
+    Function *hfn = getRuntimeFn(S.M, hname, HT);
+    commitEnv(B, S);
+    B.CreateCall(HT, hfn, {envArg, addr, val, oi, retaddr});
+    reloadEnv(B, S);
+    return nullptr;
+}
+
+/*
+ * Guest memory op with an inlined SoftMMU TLB fast path, mirroring the
+ * TCG backend's prepare_host_addr() exactly: same table (env-relative
+ * via measured negative offsets), same index math, same comparator,
+ * same addend. Whatever TCG calls a hit, we call a hit -- MMIO,
+ * watchpoints, dirty tracking, large pages and unmapped addresses all
+ * fail the compare and take the helper slow path, by construction, not
+ * by enumeration. Fast path additionally requires natural alignment
+ * (stricter than the backend, never wrong) and little-endian data.
+ * Commit/reload discipline: the fast path touches neither env nor guest
+ * state observably (TLB table and guest RAM only), so commits live
+ * exclusively on the slow path, inside emitGuestMemSlow.
+ */
 static bool emitGuestMem(IRBuilder<> &B, WalkState &S, const Tier2OpRec &op,
                          bool isLoad, bool &ok)
 {
@@ -330,96 +708,325 @@ static bool emitGuestMem(IRBuilder<> &B, WalkState &S, const Tier2OpRec &op,
         return false;
     }
     unsigned size = (unsigned)(op.imm2 & 0xff);
-    unsigned sign = (unsigned)((op.imm2 >> 8) & 0xff);
-    unsigned bswap = (unsigned)((op.imm2 >> 16) & 0xff);
-    if (bswap) {
-        return false;
-    }
+    bool sign = (op.imm2 >> 8) & 1;
+    bool forbidden = (op.imm2 >> 31) & 1;
+    unsigned mmuidx = (unsigned)((op.imm2 >> 24) & 31);
     if (size != 1 && size != 2 && size != 4 && size != 8) {
+        if (S.debug) {
+            fprintf(stderr, "[tier2-jit] bail tb=%u: guestmem size %u\n",
+                    S.cur_tb, size);
+        }
         return false;
-    }
-    if (S.rec->cflags & TIER2_CF_PARALLEL) {
-        return false; /* atomics need TCG's exact expansion */
     }
     const Tier2MemHelpers &H = S.trace->mem_helpers;
-    void *helper = nullptr;
+    const void *haddr = nullptr;
     if (!isLoad) {
-        helper = size == 1 ? H.st8 : size == 2 ? H.st16 : size == 4 ? H.st32 : H.st64;
+        haddr = size == 1 ? H.st8 : size == 2 ? H.st16 : size == 4 ? H.st32 : H.st64;
     } else if (size == 8) {
-        helper = H.ld64;
+        haddr = H.ld64;
     } else if (!sign) {
-        helper = size == 1 ? H.ld8u : size == 2 ? H.ld16u : H.ld32u;
+        haddr = size == 1 ? H.ld8u : size == 2 ? H.ld16u : H.ld32u;
     } else {
-        helper = size == 1 ? H.ld8s : size == 2 ? H.ld16s : H.ld32s;
+        haddr = size == 1 ? H.ld8s : size == 2 ? H.ld16s : H.ld32s;
     }
-    if (!helper) {
+    if (!haddr) {
+        if (S.debug) {
+            fprintf(stderr, "[tier2-jit] bail tb=%u: guestmem helper missing (size %u sign %u)\n",
+                    S.cur_tb, size, sign);
+        }
         return false;
     }
-    Value *addr = useTemp(B, S, isLoad ? op.src1 : op.src2, ok);
+    const char *hname = memHelperName(isLoad, size, sign);
+    Value *addr = useTemp(B, S, S.cur_tb, isLoad ? op.src1 : op.src2, ok);
     if (!ok) {
         return false;
+    }
+    Value *val = nullptr;
+    if (!isLoad) {
+        val = useTemp(B, S, S.cur_tb, op.src1, ok);
+        if (!ok) {
+            return false;
+        }
     }
     LLVMContext &C = S.C;
     Type *PtrTy = PointerType::get(C, 0);
     Type *I64 = S.I64;
     Type *I32 = Type::getInt32Ty(C);
-    Value *retaddr = B.CreatePtrToInt(
-        B.CreateCall(Intrinsic::getOrInsertDeclaration(S.M, Intrinsic::returnaddress),
-                     {B.getInt32(0)}),
-        I64);
-    Value *envArg = B.CreateBitCast(S.envI8, PtrTy);
-    Value *oi = B.getInt32((uint32_t)op.imm1);
-    Value *hfn = B.CreateIntToPtr(B.getInt64((uint64_t)helper), PtrTy);
-    if (isLoad) {
-        FunctionType *HT = FunctionType::get(I64, {PtrTy, I64, I32, I64}, false);
-        Value *r = B.CreateCall(HT, hfn, {envArg, addr, oi, retaddr});
+
+    auto finishLoad = [&](Value *r) -> bool {
         if (op.bits == 32) {
             r = maskTo(B, r, 32);
         }
-        if (!tempOk(S.rec, op.dst)) {
+        if (!tempOk(S, S.cur_tb, op.dst)) {
             ok = false;
             return false;
         }
-        defTemp(B, S, op.dst, r);
+        defTemp(B, S, S.cur_tb, op.dst, r);
+        return true;
+    };
+
+    const Tier2TlbLayout &T = S.trace->tlb;
+    if (!T.valid || forbidden) {
+        /* Helper-only: user mode, byteswapped data, parallel atomics. */
+        Value *r = emitGuestMemSlow(B, S, op, isLoad, addr, val, hname);
+        if (isLoad) {
+            return finishLoad(r);
+        }
+        return true;
+    }
+
+    Function *F = B.GetInsertBlock()->getParent();
+    BasicBlock *fast = BasicBlock::Create(C, "tlb_fast", F);
+    BasicBlock *slow = BasicBlock::Create(C, "tlb_slow", F);
+    BasicBlock *cont = BasicBlock::Create(C, "tlb_cont", F);
+
+    Value *aligned = B.CreateICmpEQ(
+        B.CreateAnd(addr, B.getInt64(size - 1)), B.getInt64(0));
+    B.CreateCondBr(aligned, fast, slow);
+
+    /* --- fast path --- */
+    B.SetInsertPoint(fast);
+    int64_t fi = (int64_t)T.n_modes - 1 - (int64_t)mmuidx;
+    Value *fdesc = B.CreateGEP(B.getInt8Ty(), S.envI8,
+                               B.getInt64(T.f0_off + fi * T.f_stride));
+    Value *fdesc_p = B.CreateBitCast(fdesc, PtrTy);
+    Value *mask = B.CreateLoad(I64, fdesc_p);
+    Value *table = B.CreateLoad(
+        PtrTy, B.CreateGEP(I64, fdesc_p, B.getInt64(1)));
+    Value *x = B.CreateAnd(
+        B.CreateLShr(addr, B.getInt64(T.page_bits - T.entry_bits)), mask);
+    Value *eptr = B.CreateGEP(B.getInt8Ty(), table, x);
+    Value *eptr_p = B.CreateBitCast(eptr, PtrTy);
+    int64_t cmp_off = isLoad ? T.e_read : T.e_write;
+    Value *cmp = B.CreateLoad(
+        I64, B.CreateGEP(I64, eptr_p, B.getInt64(cmp_off / 8)));
+    Value *addend = B.CreateLoad(
+        I64, B.CreateGEP(I64, eptr_p, B.getInt64(T.e_addend / 8)));
+    Value *adj = B.CreateAnd(addr, B.getInt64(T.page_mask | (size - 1)));
+    Value *hit;
+    if ((op.imm2 >> 9) & 1) {
+        /* 32-bit guest address: compare low 32 bits like the backend. */
+        hit = B.CreateICmpEQ(B.CreateTrunc(cmp, I32),
+                             B.CreateTrunc(adj, I32));
     } else {
-        Value *val = useTemp(B, S, op.src1, ok);
-        if (!ok) {
-            return false;
+        hit = B.CreateICmpEQ(cmp, adj);
+    }
+    BasicBlock *hitBB = BasicBlock::Create(C, "tlb_hit", F);
+    B.CreateCondBr(hit, hitBB, slow);
+
+    B.SetInsertPoint(hitBB);
+    Value *host = B.CreateAdd(addr, addend);
+    Value *hostp = B.CreateIntToPtr(host, PtrTy);
+    Type *mt = size == 1 ? (Type *)Type::getInt8Ty(C)
+               : size == 2 ? (Type *)Type::getInt16Ty(C)
+               : size == 4 ? (Type *)Type::getInt32Ty(C)
+                           : (Type *)S.I64;
+    Value *fastVal = nullptr;
+    if (isLoad) {
+        Value *fv = B.CreateLoad(mt, hostp, false);
+        cast<LoadInst>(fv)->setAlignment(Align(size));
+        if (size < 8) {
+            fv = sign ? B.CreateSExt(fv, S.I64) : B.CreateZExt(fv, S.I64);
         }
-        Type *VT = size == 8 ? I64 : (Type *)I32;
-        if (size != 8) {
-            val = B.CreateTrunc(val, I32);
+        fastVal = fv;
+    } else {
+        Value *sv = val;
+        if (size < 8) {
+            sv = B.CreateTrunc(sv, IntegerType::get(C, size * 8));
         }
-        FunctionType *HT = FunctionType::get(Type::getVoidTy(C),
-                                             {PtrTy, I64, VT, I32, I64}, false);
-        B.CreateCall(HT, hfn, {envArg, addr, val, oi, retaddr});
+        StoreInst *st = B.CreateStore(sv, hostp, false);
+        st->setAlignment(Align(size));
+    }
+    B.CreateBr(cont);
+
+    /* --- slow path --- */
+    B.SetInsertPoint(slow);
+    Value *slowVal = emitGuestMemSlow(B, S, op, isLoad, addr, val, hname);
+    B.CreateBr(cont);
+
+    /* --- continue --- */
+    B.SetInsertPoint(cont);
+    if (isLoad) {
+        PHINode *phi = B.CreatePHI(I64, 2);
+        phi->addIncoming(fastVal, hitBB);
+        phi->addIncoming(slowVal, slow);
+        return finishLoad(phi);
     }
     return true;
 }
 
+/*
+ * Classify a goto_ptr's address temp. Returns a trace index for
+ * statically-known in-trace targets, LOOKUP_CALL (-2) when the nearest
+ * dominating definition is a call to helper_lookup_tb_ptr (tail-call
+ * the prologue with its result), or -1 (dynamic: side-exit).
+ * See staticGotoTarget's comment for why the scan is exact.
+ */
+#define T2_GOTO_LOOKUP_CALL (-2)
+
+static int classifyGotoAddr(const Tier2TraceDesc *trace, uint32_t tb,
+                            uint32_t opidx, uint64_t *static_pc)
+{
+    const Tier2TBRec &rec = trace->recs[tb];
+    const Tier2OpRec &op = rec.ops[opidx];
+    int32_t addr = op.src1;
+    if (addr < 0 || (uint32_t)addr >= rec.num_temps) {
+        return -1;
+    }
+    const Tier2TempRec &atr = rec.temps[addr];
+    if (atr.is_const) {
+        uint64_t target = atr.const_val;
+        if (atr.tbits == 32) {
+            target &= 0xffffffffULL;
+        }
+        *static_pc = target;
+        return -3;
+    }
+    for (int32_t j = (int32_t)opidx - 1; j >= 0; j--) {
+        const Tier2OpRec &r = rec.ops[j];
+        if (r.op == T2_SETLABEL) {
+            return -1; /* control could arrive with another value */
+        }
+        if (r.dst != addr) {
+            continue;
+        }
+        /* Nearest dominating definition found. */
+        if (r.op == T2_MOV && r.src1 >= 0 &&
+            (uint32_t)r.src1 < rec.num_temps &&
+            rec.temps[r.src1].is_const) {
+            uint64_t target = rec.temps[r.src1].const_val;
+            if (rec.temps[r.src1].tbits == 32) {
+                target &= 0xffffffffULL;
+            }
+            *static_pc = target;
+            return -3;
+        }
+        if (r.op == T2_CALL && trace->lookup_helper != nullptr &&
+            (uint64_t)r.imm1 == (uint64_t)trace->lookup_helper) {
+            return T2_GOTO_LOOKUP_CALL;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+/*
+ * Resolve a goto_ptr's target statically, purely from the op stream.
+ * The translator materializes direct-transfer targets as `mov T, <const>`
+ * into the same temp the goto_ptr reads (see gen_jmp_rel/gen_eob), so a
+ * backward scan for the dominating definition is EXACT, not heuristic:
+ * - addr temp is itself const -> its value;
+ * - nearest preceding def is mov-from-const with no set_label between
+ *   the def and the goto (straight-line dominance) -> that constant;
+ * - anything else (computed address: returns, indirect calls, a label
+ *   in between) -> dynamic (-1).
+ * Returns the trace index of the TB starting at that PC, or -1 when
+ * dynamic, ambiguous (duplicate PCs), or outside the trace.
+ */
+static int staticGotoTarget(const Tier2TraceDesc *trace,
+                            const std::map<uint64_t, uint32_t> &pc2idx,
+                            uint32_t tb, uint32_t opidx)
+{
+    uint64_t target = 0;
+    if (classifyGotoAddr(trace, tb, opidx, &target) != -3) {
+        return -1;
+    }
+    auto it = pc2idx.find(target);
+    return it == pc2idx.end() ? -1 : (int)it->second;
+}
+
+/* Any proven forward edge out of tb (slot-agnostic, for reachability;
+ * emission still checks the op's slot via internalGotoEdge). */
+static int provenEdgeTarget(const Tier2TraceDesc *trace, uint32_t tb)
+{
+    if (tb >= trace->num_tbs) {
+        return -1;
+    }
+    if (trace->next_slot[tb] != 0 && trace->next_slot[tb] != 1) {
+        return -1;
+    }
+    int32_t nx = trace->next[tb];
+    if (nx <= (int32_t)tb || (uint32_t)nx >= trace->num_tbs) {
+        return -1;
+    }
+    return nx;
+}
+
+/*
+ * Proven-internal goto_tb edge for TB tb's slot idx, or -1 for side-exit.
+ * Rules, all about never executing a TB the guest wouldn't:
+ * - next[]/next_slot[] come from jmp_dest links observed at discovery;
+ * - the op's slot must equal the observed slot (the other slot may lead
+ *   anywhere, including out of the trace);
+ * - strictly forward edges (target index > source) go internal, so
+ *   multi-TB fusion stays acyclic by construction;
+ * - self-edges (target == source, P5 native loops) go internal too: the
+ *   back-branch targets the TB's own entry block, whose cells stay live
+ *   (init dominates in the function entry, runs once), and the emission
+ *   site adds an interrupt safepoint poll so the loop always returns.
+ *   Multi-TB back-edges (target < source, target != source) stay side
+ *   exits.
+ */
+static int internalGotoEdge(const Tier2TraceDesc *trace, uint32_t tb,
+                            int64_t slot)
+{
+    if (tb >= trace->num_tbs) {
+        return -1;
+    }
+    if (trace->next_slot[tb] != 0 && trace->next_slot[tb] != 1) {
+        return -1;
+    }
+    if (trace->next_slot[tb] != slot) {
+        return -1;
+    }
+    int32_t nx = trace->next[tb];
+    if (nx == (int32_t)tb) {
+        return tb; /* self back-edge */
+    }
+    int t = provenEdgeTarget(trace, tb);
+    if (t < 0) {
+        return -1;
+    }
+    /* tb is in range here (provenEdgeTarget checked). The op's slot must
+     * equal the observed slot. */
+    if (trace->next_slot[tb] != slot) {
+        return -1;
+    }
+    return t;
+}
+
 /* Lower one TB record into the function. Returns false to bail (caller
  * falls back to TCG). Never guesses: unknown ops, undefined branch
- * targets, unterminated traces, and non-env temp bases all bail. */
-static bool emitTB(IRBuilder<> &B, WalkState &S)
+ * targets, unterminated TBs, and non-env temp bases all bail.
+ * Labels are namespaced per TB (TCG label ids restart per translation);
+ * inter-TB flow uses the trace's proven edges, never label matching. */
+static bool emitTB(IRBuilder<> &B, WalkState &S, uint32_t tb)
 {
-    const Tier2TBRec *rec = S.rec;
+    S.cur_tb = tb;
+    S.dead = false;
+    const Tier2TBRec *rec = &S.trace->recs[tb];
     LLVMContext &C = S.C;
 
     /* Pre-scan labels so forward branches resolve. */
     for (uint32_t i = 0; i < rec->num_ops; i++) {
         if (rec->ops[i].op == T2_SETLABEL) {
             int64_t id = rec->ops[i].imm1;
-            if (S.labels.count(id)) {
+            auto key = std::make_pair(tb, id);
+            if (S.labels.count(key)) {
                 return false; /* duplicate label: don't guess */
             }
-            S.labels[id] = BasicBlock::Create(C, "L", S.F);
+            S.labels[key] = BasicBlock::Create(C, "L", S.F);
         }
     }
 
     auto needLabel = [&](int64_t id, BasicBlock *&bb) -> bool {
-        auto it = S.labels.find(id);
+        auto it = S.labels.find(std::make_pair(tb, id));
         if (it == S.labels.end()) {
-            return false; /* side exit with unknown target: bail */
+            if (S.debug) {
+                fprintf(stderr, "[tier2-jit] bail tb=%u: branch to undefined label %lld\n",
+                        tb, (long long)id);
+            }
+            return false; /* branch with unknown target: bail */
         }
         bb = it->second;
         return true;
@@ -439,50 +1046,50 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
         if (b != 32 && b != 64) {
             return false;
         }
-        auto U = [&](int32_t t) -> Value * { return useTemp(B, S, t, ok); };
+        auto U = [&](int32_t t) -> Value * { return useTemp(B, S, tb, t, ok); };
         switch (op.op) {
         case T2_MOV:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, U(op.src1));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, U(op.src1));
             break;
         case T2_ADD:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, maskTo(B, B.CreateAdd(U(op.src1), U(op.src2)), b));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, maskTo(B, B.CreateAdd(U(op.src1), U(op.src2)), b));
             break;
         case T2_SUB:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, maskTo(B, B.CreateSub(U(op.src1), U(op.src2)), b));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, maskTo(B, B.CreateSub(U(op.src1), U(op.src2)), b));
             break;
         case T2_MUL:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, maskTo(B, B.CreateMul(U(op.src1), U(op.src2)), b));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, maskTo(B, B.CreateMul(U(op.src1), U(op.src2)), b));
             break;
         case T2_AND:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, B.CreateAnd(U(op.src1), U(op.src2)));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, B.CreateAnd(U(op.src1), U(op.src2)));
             break;
         case T2_OR:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, B.CreateOr(U(op.src1), U(op.src2)));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, B.CreateOr(U(op.src1), U(op.src2)));
             break;
         case T2_XOR:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, B.CreateXor(U(op.src1), U(op.src2)));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, B.CreateXor(U(op.src1), U(op.src2)));
             break;
         case T2_NEG:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, maskTo(B, B.CreateSub(B.getInt64(0), U(op.src1)), b));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, maskTo(B, B.CreateSub(B.getInt64(0), U(op.src1)), b));
             break;
         case T2_NOT:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, B.CreateXor(U(op.src1), B.getInt64(~0ULL)));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, B.CreateXor(U(op.src1), B.getInt64(~0ULL)));
             break;
         case T2_SHL:
         case T2_SHR:
         case T2_SAR:
         case T2_ROTL:
         case T2_ROTR: {
-            if (!tempOk(rec, op.dst)) { return false; }
+            if (!tempOk(S, tb, op.dst)) { return false; }
             Value *a = U(op.src1);
             Value *cnt = B.CreateAnd(U(op.src2), B.getInt64(b - 1));
             Value *r = nullptr;
@@ -506,22 +1113,22 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
                 r = B.CreateSelect(B.CreateICmpEQ(cnt, B.getInt64(0)), lo,
                                    maskTo(B, B.CreateOr(fwd, bwd), b));
             }
-            defTemp(B, S, op.dst, maskTo(B, r, b));
+            defTemp(B, S, tb, op.dst, maskTo(B, r, b));
             break;
         }
         case T2_EXTRACT: {
-            if (!tempOk(rec, op.dst)) { return false; }
+            if (!tempOk(S, tb, op.dst)) { return false; }
             uint64_t off = (uint64_t)op.imm1 & 63;
             uint64_t len = (uint64_t)op.imm2 & 127;
             Value *v = B.CreateLShr(U(op.src1), B.getInt64(off));
             if (len < 64) {
                 v = B.CreateAnd(v, B.getInt64(len == 64 ? ~0ULL : ((1ULL << len) - 1)));
             }
-            defTemp(B, S, op.dst, v);
+            defTemp(B, S, tb, op.dst, v);
             break;
         }
         case T2_SEXTRACT: {
-            if (!tempOk(rec, op.dst)) { return false; }
+            if (!tempOk(S, tb, op.dst)) { return false; }
             uint64_t off = (uint64_t)op.imm1 & 63;
             uint64_t len = (uint64_t)op.imm2 & 127;
             Value *v = B.CreateLShr(U(op.src1), B.getInt64(off));
@@ -532,49 +1139,49 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
                 Value *t = B.CreateTrunc(v, IntegerType::get(C, (unsigned)len));
                 r = B.CreateSExt(t, S.I64);
             }
-            defTemp(B, S, op.dst, r);
+            defTemp(B, S, tb, op.dst, r);
             break;
         }
         case T2_DEPOSIT: {
-            if (!tempOk(rec, op.dst)) { return false; }
+            if (!tempOk(S, tb, op.dst)) { return false; }
             uint64_t off = (uint64_t)op.imm1 & 63;
             uint64_t len = (uint64_t)op.imm2 & 127;
             uint64_t m = (len >= 64) ? ~0ULL : (((1ULL << len) - 1) << off);
             Value *v = B.CreateOr(
                 B.CreateAnd(U(op.src1), B.getInt64(~m)),
                 B.CreateAnd(B.CreateShl(U(op.src2), B.getInt64(off)), B.getInt64(m)));
-            defTemp(B, S, op.dst, maskTo(B, v, b));
+            defTemp(B, S, tb, op.dst, maskTo(B, v, b));
             break;
         }
         case T2_EXT32U:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, maskTo(B, U(op.src1), 32));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, maskTo(B, U(op.src1), 32));
             break;
         case T2_EXT32S: {
-            if (!tempOk(rec, op.dst)) { return false; }
+            if (!tempOk(S, tb, op.dst)) { return false; }
             Value *t = B.CreateTrunc(U(op.src1), IntegerType::get(C, 32));
-            defTemp(B, S, op.dst, B.CreateSExt(t, S.I64));
+            defTemp(B, S, tb, op.dst, B.CreateSExt(t, S.I64));
             break;
         }
         case T2_EXTRL:
-            if (!tempOk(rec, op.dst)) { return false; }
-            defTemp(B, S, op.dst, maskTo(B, U(op.src1), 32));
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            defTemp(B, S, tb, op.dst, maskTo(B, U(op.src1), 32));
             break;
         case T2_SETCOND: {
-            if (!tempOk(rec, op.dst)) { return false; }
+            if (!tempOk(S, tb, op.dst)) { return false; }
             Value *c = emitCond(B, C, (unsigned)op.imm1, b, U(op.src1), U(op.src2));
             if (!c) { return false; }
-            defTemp(B, S, op.dst, B.CreateZExt(c, S.I64));
+            defTemp(B, S, tb, op.dst, B.CreateZExt(c, S.I64));
             break;
         }
         case T2_MOVCOND: {
-            if (!tempOk(rec, op.dst)) { return false; }
+            if (!tempOk(S, tb, op.dst)) { return false; }
             Value *c = emitCond(B, C, (unsigned)op.imm1, b, U(op.src1), U(op.src2));
             if (!c) { return false; }
             Value *v1 = U(op.src3);
             Value *v2 = U(op.src4);
             if (!ok) { return false; }
-            defTemp(B, S, op.dst, B.CreateSelect(c, v1, v2));
+            defTemp(B, S, tb, op.dst, B.CreateSelect(c, v1, v2));
             break;
         }
         case T2_LD8U:
@@ -585,7 +1192,7 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
         case T2_LD32S:
         case T2_LD32:
         case T2_LD64: {
-            if (!tempOk(rec, op.dst)) { return false; }
+            if (!tempOk(S, tb, op.dst)) { return false; }
             Type *mt = nullptr;
             bool sext = false;
             switch (op.op) {
@@ -599,13 +1206,30 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
             case T2_LD64: mt = Type::getInt64Ty(C); break;
             default: break;
             }
+            /*
+             * Cells run ahead of env (defs commit lazily), so flush this
+             * slot first -- then the env load observes everything. When
+             * no cell exists the slot was never defined in-trace and env
+             * is already the truth; commitOne is a no-op there. Either
+             * way LLVM forwards the store into the load, so the pair
+             * usually vanishes in O2.
+             */
+            /*
+             * Flush-before-read, but only if this slot was ever defined
+             * in-trace: otherwise env is already the truth (a helper may
+             * even have written it since init, which we must NOT clobber
+             * with the stale init-loaded cell).
+             */
+            if (S.definedSet.count((int32_t)op.imm1)) {
+                commitOne(B, S, (int32_t)op.imm1);
+            }
             Value *v = B.CreateLoad(mt, envPtr(B, S.envI8, op.imm1));
             if (mt->isIntegerTy(8) || mt->isIntegerTy(16) || mt->isIntegerTy(32)) {
                 unsigned w = mt->getIntegerBitWidth();
                 v = sext ? B.CreateSExt(v, S.I64) : B.CreateZExt(v, S.I64);
                 (void)w;
             }
-            defTemp(B, S, op.dst, v);
+            defTemp(B, S, tb, op.dst, v);
             break;
         }
         case T2_ST8:
@@ -623,6 +1247,22 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
                 v = B.CreateTrunc(v, IntegerType::get(C, w));
             }
             B.CreateStore(v, envPtr(B, S.envI8, op.imm1));
+            /*
+             * Keep a shared cell coherent when one exists: the stored
+             * bytes win, the rest stays as the cell had it (exactly what
+             * a later LD-from-cell-after-commit observes). No cell means
+             * no in-trace reader can go stale -- env is the truth.
+             */
+            auto it = S.cells.find(std::make_pair(
+                0xFFFFFFFFu, (uint64_t)(uint32_t)(int32_t)op.imm1));
+            if (it != S.cells.end()) {
+                Value *old = B.CreateLoad(S.I64, it->second);
+                uint64_t m = w >= 64 ? ~0ULL : ((1ULL << w) - 1);
+                Value *nv = B.CreateOr(
+                    B.CreateAnd(old, B.getInt64(~m)),
+                    B.CreateAnd(B.CreateZExt(v, S.I64), B.getInt64(m)));
+                B.CreateStore(nv, it->second);
+            }
             break;
         }
         case T2_QEMU_LD:
@@ -631,6 +1271,151 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
         case T2_QEMU_ST:
             if (!emitGuestMem(B, S, op, /*isLoad=*/false, ok)) { return false; }
             break;
+        case T2_CALL: {
+            /*
+             * Bit-exact C call to the recorded helper address, prototype
+             * from imm2 (retcode | a0<<3 | ... | nr_in<<16 | nr_out<<20).
+             * i32 params truncate (cells hold zero-extended values, matching
+             * what TCG's EXTEND shims feed the callee); the env-marker temp
+             * passes the live env pointer. Return masked by defTemp.
+             */
+            unsigned rc = (unsigned)(op.imm2 & 7);
+            unsigned ni = (unsigned)((op.imm2 >> 16) & 0xF);
+            unsigned no = (unsigned)((op.imm2 >> 20) & 0xF);
+            if (ni > 4 || no > 1) {
+                if (S.debug) {
+                    fprintf(stderr, "[tier2-jit] bail tb=%u: call arity ni=%u no=%u\n",
+                            tb, ni, no);
+                }
+                return false;
+            }
+            if ((no == 0) != (rc == T2T_VOID)) {
+                if (S.debug) {
+                    fprintf(stderr, "[tier2-jit] bail tb=%u: call ret mismatch\n", tb);
+                }
+                return false;
+            }
+            if (rc != T2T_VOID && rc != T2T_I32 && rc != T2T_I64 &&
+                rc != T2T_PTR) {
+                if (S.debug) {
+                    fprintf(stderr, "[tier2-jit] bail tb=%u: call rettype %u\n", tb, rc);
+                }
+                return false;
+            }
+            Type *retTy = rc == T2T_VOID ? Type::getVoidTy(C)
+                          : rc == T2T_I32 ? (Type *)Type::getInt32Ty(C)
+                          : rc == T2T_I64 ? (Type *)S.I64
+                                          : (Type *)PointerType::get(C, 0);
+            int32_t argids[4] = {op.src1, op.src2, op.src3, op.src4};
+            std::vector<Type *> argTys;
+            std::vector<Value *> argVs;
+            for (unsigned k = 0; k < ni; k++) {
+                unsigned ac = (unsigned)((op.imm2 >> (3 + 3 * k)) & 7);
+                if (ac != T2T_I32 && ac != T2T_I64 && ac != T2T_PTR) {
+                    if (S.debug) {
+                        fprintf(stderr, "[tier2-jit] bail tb=%u: call argtype %u\n",
+                                tb, ac);
+                    }
+                    return false;
+                }
+                Type *at = ac == T2T_I32 ? (Type *)Type::getInt32Ty(C)
+                           : ac == T2T_I64 ? (Type *)S.I64
+                                           : (Type *)PointerType::get(C, 0);
+                Value *av = U(argids[k]);
+                if (!ok) {
+                    return false;
+                }
+                if (ac == T2T_I32) {
+                    av = B.CreateTrunc(av, Type::getInt32Ty(C));
+                } else if (ac == T2T_PTR) {
+                    av = B.CreateIntToPtr(av, PointerType::get(C, 0));
+                }
+                argTys.push_back(at);
+                argVs.push_back(av);
+            }
+            FunctionType *FT = FunctionType::get(retTy, argTys, false);
+            /*
+             * Call through the recorded helper NAME (link-time external),
+             * never the recorded ADDRESS: op.imm1 is this process's
+             * address (ASLR-unstable), and baking it poisons cached
+             * objects for future processes (stale blr target -> SIGSEGV
+             * on load). Unnamed targets force no_cache (ckey=0, never
+             * stored), so the baked fallback below only ever runs
+             * uncached in this process.
+             */
+            Value *fn = nullptr;
+            if (const char *nm = callNameFor(S.trace, (uint64_t)op.imm1)) {
+                fn = getRuntimeFn(S.M, nm, FT);
+            } else {
+                if (S.debug) {
+                    fprintf(stderr, "[tier2-jit] tb=%u: UNNAMED call target "
+                            "%p, baking address (uncached-only)\n",
+                            tb, (void *)(uint64_t)op.imm1);
+                }
+                fn = B.CreateIntToPtr(B.getInt64((uint64_t)op.imm1),
+                                      PointerType::get(C, 0));
+            }
+            /*
+             * Helpers observe and mutate env through memory: flush cells
+             * first, reload after (the callee may have changed anything).
+             */
+            commitEnv(B, S);
+            Value *r = B.CreateCall(FT, fn, argVs);
+            reloadEnv(B, S);
+            if (no == 1) {
+                if (rc == T2T_PTR) {
+                    r = B.CreatePtrToInt(r, S.I64);
+                } else if (rc == T2T_I32) {
+                    r = B.CreateZExt(r, S.I64);
+                }
+                if (!tempOk(S, tb, op.dst)) {
+                    return false;
+                }
+                defTemp(B, S, tb, op.dst, r);
+            }
+            break;
+        }
+        case T2_BSWAP16:
+        case T2_BSWAP32:
+        case T2_BSWAP64: {
+            if (!tempOk(S, tb, op.dst)) {
+                return false;
+            }
+            Value *a = U(op.src1);
+            if (!ok) {
+                return false;
+            }
+            unsigned size = op.op == T2_BSWAP16 ? 16
+                            : op.op == T2_BSWAP32 ? 32 : 64;
+            /* Input masked to size (capture required IZ); swap within
+             * the field via the LLVM bswap intrinsic. */
+            Value *lo = maskTo(B, a, size);
+            Value *t = B.CreateTrunc(lo, IntegerType::get(C, size));
+            Value *sw = B.CreateCall(
+                Intrinsic::getOrInsertDeclaration(S.M, Intrinsic::bswap,
+                                                  {IntegerType::get(C, size)}),
+                {t});
+            Value *r;
+            if (op.op == T2_BSWAP16 && (op.imm1 & 4)) {
+                r = B.CreateSExt(sw, S.I64); /* TCG_BSWAP_OS */
+            } else {
+                r = B.CreateZExt(sw, S.I64); /* OZ (required at capture) */
+            }
+            defTemp(B, S, tb, op.dst, r);
+            break;
+        }
+        case T2_NEGSETCOND: {
+            if (!tempOk(S, tb, op.dst)) {
+                return false;
+            }
+            Value *c = emitCond(B, C, (unsigned)op.imm1, b, U(op.src1), U(op.src2));
+            if (!c) {
+                return false;
+            }
+            defTemp(B, S, tb, op.dst, B.CreateSub(B.getInt64(0),
+                                                  B.CreateZExt(c, S.I64)));
+            break;
+        }
         case T2_BR: {
             BasicBlock *dst = nullptr;
             if (!needLabel(op.imm1, dst)) { return false; }
@@ -649,7 +1434,7 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
             break;
         }
         case T2_SETLABEL: {
-            auto it = S.labels.find(op.imm1);
+            auto it = S.labels.find(std::make_pair(tb, op.imm1));
             if (it == S.labels.end()) { return false; }
             if (!S.dead && B.GetInsertBlock()->getTerminator() == nullptr) {
                 B.CreateBr(it->second);
@@ -658,19 +1443,149 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
             S.dead = false;
             break;
         }
-        case T2_EXIT_TB:
-            B.CreateRet(B.getInt64((uint64_t)op.imm1));
+        case T2_EXIT_TB: {
+            uint64_t imm = (uint64_t)op.imm1;
+            commitEnv(B, S);
+            if ((imm & ~3ULL) == 0) {
+                /*
+                 * Null-TB exit (e.g. exit_tb(NULL, 0)): verbatim value,
+                 * stable across processes (no pointer baked). The
+                 * dispatcher takes last_tb=NULL and re-derives.
+                 */
+                B.CreateRet(B.getInt64(imm));
+            } else {
+                /*
+                 * resolve-later exit: the baked tb part must name THIS
+                 * TB (translators always exit their own TB or NULL);
+                 * anything else is a shape we don't model -> bail.
+                 * Compared with low bits masked (they carry idx).
+                 */
+                uint64_t rx = (uint64_t)S.trace->recs[tb].rx_tb;
+                if (!rx || (imm & ~3ULL) != (rx & ~3ULL)) {
+                    return false;
+                }
+                B.CreateRet(B.getInt64(TIER2_EXIT_PROTOCOL |
+                                       ((uint64_t)tb << 2) | (imm & 3)));
+            }
             S.dead = true;
             break;
+        }
         case T2_GOTO_TB: {
-            /* Same contract as unlinked TCG goto_tb: return to the
-             * dispatcher, which chains via jmp_target_addr. */
-            uint64_t rv = (uint64_t)S.trace->rx_header + (uint64_t)op.imm1;
-            B.CreateRet(B.getInt64(rv));
+            int internal = internalGotoEdge(S.trace, tb, op.imm1);
+            if (internal >= 0) {
+                if ((uint32_t)internal == tb) {
+                    /*
+                     * Proven self back-edge (P5 native loop): run the TB
+                     * again instead of round-tripping the dispatcher per
+                     * iteration. Commit first: the back-edge re-executes
+                     * the TB from its top (including leading env loads),
+                     * so env must be coherent -- exactly TCG's TB-boundary
+                     * invariant, which is also what the poll-exit path
+                     * needs. Then poll interrupt_request so a tight loop
+                     * can never starve interrupts (nonzero takes the same
+                     * side-exit this edge used before). Without safepoint
+                     * offsets (measured lazily on a live vCPU;
+                     * workload-trigger compiles can precede measurement),
+                     * keep the old side-exit.
+                     */
+                    if (!S.trace->has_safepoint) {
+                        internal = -1;
+                    } else {
+                        BasicBlock *loop = S.entries[tb];
+                        BasicBlock *irq =
+                            BasicBlock::Create(C, "safepoint", S.F);
+                        commitEnv(B, S);
+                        Value *cpu = B.CreateGEP(B.getInt8Ty(), S.envI8,
+                                                 B.getInt64(S.trace->cpu_off));
+                        Value *irqp = B.CreateBitCast(
+                            B.CreateGEP(B.getInt8Ty(), cpu,
+                                        B.getInt64(S.trace->irq_off)),
+                            PointerType::get(C, 0));
+                        Value *pend = B.CreateLoad(Type::getInt32Ty(C), irqp);
+                        B.CreateCondBr(
+                            B.CreateICmpNE(pend, B.getInt32(0)), irq, loop);
+                        B.SetInsertPoint(irq);
+                        B.CreateRet(B.getInt64(TIER2_EXIT_PROTOCOL |
+                                               ((uint64_t)tb << 2) |
+                                               ((uint64_t)op.imm1 & 3)));
+                        S.dead = true;
+                        break;
+                    }
+                } else {
+                    /*
+                     * Proven edge (observed linked at discovery): continue
+                     * inline into the successor TB's entry block. Stale-link
+                     * races are safe by construction -- unlinking only changes
+                     * how control reaches the target, never the target's
+                     * meaning -- and invalidation clears our code outright.
+                     */
+                    B.CreateBr(S.entries[internal]);
+                    S.dead = true;
+                    break;
+                }
+            }
+            /*
+             * No proven edge: side-exit via the exit protocol (resolved
+             * against current addresses at dispatch; see TIER2_EXIT_PROTOCOL).
+             * The origin TB index travels in the value so chaining links
+             * land on the right TB, exactly as unlinked TCG would.
+             */
+            commitEnv(B, S);
+            B.CreateRet(B.getInt64(TIER2_EXIT_PROTOCOL |
+                                   ((uint64_t)tb << 2) |
+                                   ((uint64_t)op.imm1 & 3)));
+            S.dead = true;
+            break;
+        }
+        case T2_GOTO_PTR: {
+            int st = staticGotoTarget(S.trace, S.pc2idx, tb, i);
+            if (st >= 0) {
+                B.CreateBr(S.entries[st]);
+                S.dead = true;
+                break;
+            }
+            uint64_t pc = 0;
+            int cls = classifyGotoAddr(S.trace, tb, i, &pc);
+            if (cls == T2_GOTO_LOOKUP_CALL && g_prologue_fn != nullptr) {
+                /*
+                 * Address came from helper_lookup_tb_ptr: tail-call the
+                 * TCG prologue with its result and return that. Same two
+                 * functions TCG invokes, same order, minus one dispatcher
+                 * round trip. Env was committed for the lookup call by
+                 * the T2_CALL emission, and nothing runs after us.
+                 */
+                Value *code = U(op.src1);
+                if (!ok) {
+                    return false;
+                }
+                FunctionType *PT = FunctionType::get(
+                    S.I64, {PointerType::get(C, 0), PointerType::get(C, 0)},
+                    false);
+                Function *prologue =
+                    getRuntimeFn(S.M, "tier2_rt_prologue", PT);
+                Value *r = B.CreateCall(
+                    PT, prologue,
+                    {S.envI8, B.CreateIntToPtr(code, PointerType::get(C, 0))});
+                B.CreateRet(r);
+                S.dead = true;
+                break;
+            }
+            /*
+             * Dynamic target (returns, indirect calls): side-exit with a
+             * null TB so the dispatcher re-derives from env with no
+             * chaining-link write. Matches TCI's null-target behavior,
+             * generalized. Env is coherent here (commit discipline).
+             */
+            commitEnv(B, S);
+            B.CreateRet(B.getInt64(0));
             S.dead = true;
             break;
         }
         default:
+            if (S.debug) {
+                fprintf(stderr, "[tier2-jit] bail tb=%u: unsupported op %s\n",
+                        tb, t2opname(op.op));
+            }
             return false; /* T2_UNSUPPORTED or unknown: don't guess */
         }
     }
@@ -685,66 +1600,191 @@ static bool emitTB(IRBuilder<> &B, WalkState &S)
     }
     BasicBlock *cur = B.GetInsertBlock();
     if (cur->getTerminator() == nullptr) {
+        if (S.debug) {
+            fprintf(stderr, "[tier2-jit] bail tb=%u: unterminated (%u ops)\n",
+                    tb, rec->num_ops);
+        }
         return false;
     }
     return true;
 }
 
-/* Compile one TB record inline; v1 compiles the trace header TB only and
- * executes it once per dispatch (same granularity as TCG). Multi-TB loop
- * fusion is future work: traces with num_tbs > 1 fall back for now. */
+/*
+ * Compile a fused multi-TB trace inline. Execution starts at the header
+ * TB and follows proven-internal edges (forward edges, plus self
+ * back-edges with an interrupt safepoint poll, so every dispatch still
+ * returns); all other transfers side-exit to the dispatcher with
+ * origin-correct return values. Env-slot globals are shared across TBs
+ * (eager commits keep env a superset of TCG's lazy state, which is what
+ * makes exits sound anywhere); EBB temps stay per-TB; consts fold inline.
+ */
 static bool tryCompileOps(Module *M, LLVMContext &C, Function *F,
                           Value *env_arg, const Tier2TraceDesc *trace)
 {
-    if (trace->num_tbs != 1) {
+    uint32_t n = trace->num_tbs;
+    if (n == 0 || n > TIER2_MAX_TRACE_TBS) {
         return false;
     }
-    const Tier2TBRec &rec = trace->recs[0];
-    if (rec.num_ops == 0 || rec.num_temps == 0 ||
-        rec.num_temps > TIER2_JIT_MAX_TEMPS ||
-        rec.num_ops > TIER2_JIT_MAX_OPS) {
+    if (trace->header_idx >= n) {
         return false;
     }
-    if (!trace->rx_header) {
-        return false;
+    for (uint32_t t = 0; t < n; t++) {
+        const Tier2TBRec &rec = trace->recs[t];
+        if (rec.num_temps > TIER2_JIT_MAX_TEMPS ||
+            rec.num_ops > TIER2_JIT_MAX_OPS) {
+            return false;
+        }
+        if (rec.num_temps == 0) {
+            return false;
+        }
     }
 
     IRBuilder<> B(BasicBlock::Create(C, "entry", F));
     Value *envI8 = B.CreateBitCast(env_arg, PointerType::get(C, 0));
 
-    WalkState S{C, M, F, envI8, &rec, trace};
+    WalkState S{C, M, F, envI8, trace};
     S.I64 = Type::getInt64Ty(C);
+    S.debug = getenv("QEMU_TIER2_DEBUG") != nullptr;
 
-    /* Temp cells: allocas in the entry block (mem2reg-promotable). */
-    S.slot.assign(rec.num_temps, nullptr);
-    for (uint32_t t = 0; t < rec.num_temps; t++) {
-        const Tier2TempRec &tr = rec.temps[t];
-        Value *cell = B.CreateAlloca(S.I64, nullptr, "t");
-        S.slot[t] = cell;
-        Value *init = B.getInt64(0);
-        if (tr.is_const) {
-            init = B.getInt64(tr.const_val);
-            if (tr.tbits == 32) {
-                init = maskTo(B, init, 32);
-            }
-        } else if (tr.env_off >= 0) {
-            if (tr.tbits == 32) {
-                Value *p = envPtr(B, envI8, tr.env_off);
-                init = B.CreateZExt(B.CreateLoad(Type::getInt32Ty(C), p), S.I64);
-            } else {
-                Value *p = envPtr(B, envI8, tr.env_off);
-                init = B.CreateLoad(S.I64, p);
-            }
-        } else if (tr.env_off == -2 && !tr.is_env) {
-            /* Non-env global: any use bails in useTemp; init undef. */
-            init = UndefValue::get(S.I64);
-        } else if (tr.is_env) {
-            init = UndefValue::get(S.I64); /* base marker, never read */
+    /* PC -> trace index for static goto_ptr resolution (first wins;
+     * duplicated PCs across TBs stay dynamic). */
+    for (uint32_t t = 0; t < n; t++) {
+        uint64_t pc = trace->recs[t].pc;
+        if (!S.pc2idx.count(pc)) {
+            S.pc2idx[pc] = t;
         }
-        B.CreateStore(init, cell);
     }
 
-    return emitTB(B, S);
+    /*
+     * Reachability closure from the header over internal goto_tb edges
+     * and statically-resolved goto_ptr targets. Unreachable TBs are not
+     * emitted at all, so truncated snapshots outside the reachable set
+     * can't bail an otherwise compilable trace.
+     */
+    bool reachable[TIER2_MAX_TRACE_TBS] = {false};
+    reachable[trace->header_idx] = true;
+    for (;;) {
+        bool grew = false;
+        for (uint32_t t = 0; t < n; t++) {
+            if (!reachable[t]) {
+                continue;
+            }
+            int ie = provenEdgeTarget(trace, t);
+            if (ie >= 0 && !reachable[ie]) {
+                reachable[ie] = true;
+                grew = true;
+            }
+            const Tier2TBRec &rec = trace->recs[t];
+            for (uint32_t i = 0; i < rec.num_ops; i++) {
+                if (rec.ops[i].op != T2_GOTO_PTR) {
+                    continue;
+                }
+                int st = staticGotoTarget(trace, S.pc2idx, t, i);
+                if (st >= 0 && !reachable[st]) {
+                    reachable[st] = true;
+                    grew = true;
+                }
+            }
+        }
+        if (!grew) {
+            break;
+        }
+    }
+
+    /* Entry block per TB in the reachable set, created upfront so
+     * forward internal edges resolve. */
+    S.entries.assign(n, nullptr);
+    for (uint32_t t = 0; t < n; t++) {
+        if (reachable[t]) {
+            S.entries[t] = BasicBlock::Create(C, "tb", F);
+        }
+    }
+
+    /*
+     * Temp cells: allocas in the entry block (mem2reg-promotable).
+     * Shared env-slot cells load the WIDEST view seen across TBs so no
+     * view is ever truncated at init (uses mask down to their width).
+     * The same map drives sized commits/reloads.
+     */
+    for (uint32_t t = 0; t < n; t++) {
+        if (!reachable[t]) {
+            continue;
+        }
+        const Tier2TBRec &rec = trace->recs[t];
+        for (uint32_t i = 0; i < rec.num_temps; i++) {
+            const Tier2TempRec &tr = rec.temps[i];
+            if (tr.is_const || tr.env_off < 0) {
+                continue;
+            }
+            unsigned &w = S.envWidths[tr.env_off];
+            if (tr.tbits == 64) {
+                w = 64;
+            } else if (w != 64) {
+                w = 32;
+            }
+        }
+        /*
+         * Defined set: env offsets ever assigned (temp DSTs, LD DSTs
+         * included -- an LD def runs ahead of env until committed).
+         * ST-only slots stay coherent via the ST path itself.
+         */
+        for (uint32_t i = 0; i < rec.num_ops; i++) {
+            int32_t d = rec.ops[i].dst;
+            if (d >= 0 && (uint32_t)d < rec.num_temps &&
+                !rec.temps[d].is_env && rec.temps[d].env_off >= 0) {
+                S.definedSet.insert(rec.temps[d].env_off);
+            }
+        }
+    }
+    for (uint32_t t = 0; t < n; t++) {
+        if (!reachable[t]) {
+            continue;
+        }
+        const Tier2TBRec &rec = trace->recs[t];
+        for (uint32_t i = 0; i < rec.num_temps; i++) {
+            const Tier2TempRec &tr = rec.temps[i];
+            if (tr.is_const || tr.env_off < 0) {
+                /* Consts fold inline; non-env temps get private cells. */
+                if (!tr.is_const) {
+                    auto key = std::make_pair(t, (uint64_t)(uint32_t)i);
+                    if (!S.cells.count(key)) {
+                        Value *cell = B.CreateAlloca(S.I64, nullptr, "t");
+                        S.cells[key] = cell;
+                        B.CreateStore(B.getInt64(0), cell);
+                    }
+                }
+                continue;
+            }
+            auto key = std::make_pair(0xFFFFFFFFu, (uint64_t)(uint32_t)tr.env_off);
+            if (!S.cells.count(key)) {
+                Value *cell = B.CreateAlloca(S.I64, nullptr, "g");
+                S.cells[key] = cell;
+                Value *init;
+                if (S.envWidths[tr.env_off] == 32) {
+                    Value *p = envPtr(B, envI8, tr.env_off);
+                    init = B.CreateZExt(B.CreateLoad(Type::getInt32Ty(C), p),
+                                        S.I64);
+                } else {
+                    Value *p = envPtr(B, envI8, tr.env_off);
+                    init = B.CreateLoad(S.I64, p);
+                }
+                B.CreateStore(init, cell);
+            }
+        }
+    }
+
+    B.CreateBr(S.entries[trace->header_idx]);
+
+    for (uint32_t t = 0; t < n; t++) {
+        if (!reachable[t]) {
+            continue;
+        }
+        B.SetInsertPoint(S.entries[t]);
+        if (!emitTB(B, S, t)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -815,9 +1855,356 @@ extern "C" void tier2_jit_shutdown(void)
         std::lock_guard<std::mutex> lk(g_mu);
         g_retired.clear();
         g_modules.clear();
+        /* Defined-externals must be re-registered with the next JIT
+         * instance (addresses are process-stable, JITDylibs are not). */
+        g_definedRt.clear();
     }
     g_jit.reset();
     g_initialized.store(false);
+}
+
+/* ------------------------------------------------------------------ */
+/* On-disk code cache (Phase 2). Same hot traces recompile identically  */
+/* across processes, so validated native objects persist under          */
+/* ~/.cache/qemu/tier2/<fnv1a64>.o and load in microseconds instead of  */
+/* tens of milliseconds. Sound because every process-unstable input is  */
+/* excluded by construction: TB addresses never enter compiled code     */
+/* (exit protocol), host addresses never bake in (named externals +     */
+/* link-time absoluteSymbols), and the key covers everything else that  */
+/* can affect codegen.                                                  */
+/* ------------------------------------------------------------------ */
+
+static std::atomic<uint64_t> g_cache_hits{0};
+
+extern "C" uint64_t tier2_jit_cache_hits(void)
+{
+    return g_cache_hits.load();
+}
+
+static uint64_t fnv1a(const void *data, size_t len, uint64_t h)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void fnvStr(uint64_t &h, const char *s, size_t n)
+{
+    h = fnv1a(s, strnlen(s, n), h);
+}
+
+/*
+ * Cache key over everything that can change the emitted object.
+ * Deliberately EXCLUDED (unstable or link-resolved): tb_obj/code_ptr/
+ * rx_tb/rx_header pointers, mem_helpers + call_addrs + prologue
+ * addresses (resolved via named externals at link), total_exec_count,
+ * trace_id, legacy tbs[] (walker uses recs[]).
+ */
+static uint64_t tier2CacheKey(const Tier2TraceDesc *trace)
+{
+    if (trace->guest_arch[0] == '\0' || trace->qemu_version[0] == '\0' ||
+        trace->no_cache) {
+        return 0;
+    }
+    uint64_t h = 1469598103934665603ULL;
+    h = fnv1a("tier2cache/1", 12, h);
+    {
+        /* Emitter epoch: any emission-semantics change must bump
+         * TIER2_CACHE_EPOCH, or stale objects load as false hits. */
+        uint64_t epoch = TIER2_CACHE_EPOCH;
+        h = fnv1a(&epoch, sizeof(epoch), h);
+    }
+    std::string triple = sys::getProcessTriple();
+    h = fnv1a(triple.c_str(), triple.size(), h);
+    int llvm_major = LLVM_VERSION_MAJOR;
+    int llvm_minor = LLVM_VERSION_MINOR;
+    h = fnv1a(&llvm_major, sizeof(llvm_major), h);
+    h = fnv1a(&llvm_minor, sizeof(llvm_minor), h);
+    fnvStr(h, trace->guest_arch, sizeof(trace->guest_arch));
+    fnvStr(h, trace->qemu_version, sizeof(trace->qemu_version));
+    h = fnv1a("O2-novector", 11, h);
+    h = fnv1a(&trace->num_tbs, sizeof(trace->num_tbs), h);
+    h = fnv1a(&trace->header_idx, sizeof(trace->header_idx), h);
+    {
+        uint8_t gm = trace->guest_mem_allowed ? 1 : 0;
+        h = fnv1a(&gm, 1, h);
+    }
+    h = fnv1a(&trace->tlb, sizeof(trace->tlb), h);
+    {
+        /* Safepoint geometry is build-derived; same rule as the epoch:
+         * anything that changes emitted code must change the key. */
+        uint8_t sp = trace->has_safepoint ? 1 : 0;
+        h = fnv1a(&sp, 1, h);
+        h = fnv1a(&trace->cpu_off, sizeof(trace->cpu_off), h);
+        h = fnv1a(&trace->irq_off, sizeof(trace->irq_off), h);
+    }
+    if (getenv("QEMU_TIER2_DEBUG")) {
+        fprintf(stderr, "[tier2-jit] keyinputs n=%u hidx=%u sp=%d cpuoff=%lld irqoff=%lld gm=%d next0=%d slot0=%d\n",
+                trace->num_tbs, trace->header_idx,
+                trace->has_safepoint ? 1 : 0,
+                (long long)trace->cpu_off, (long long)trace->irq_off,
+                trace->guest_mem_allowed ? 1 : 0,
+                trace->num_tbs > 0 ? trace->next[0] : -9,
+                trace->num_tbs > 0 ? trace->next_slot[0] : -9);
+    }
+    h = fnv1a(trace->next, sizeof(trace->next[0]) * trace->num_tbs, h);
+    h = fnv1a(trace->next_slot, sizeof(trace->next_slot[0]) * trace->num_tbs, h);
+    uint32_t callpos = 0;
+    for (uint32_t t = 0; t < trace->num_tbs; t++) {
+        const Tier2TBRec &r = trace->recs[t];
+        h = fnv1a(&r.pc, sizeof(r.pc), h);
+        h = fnv1a(&r.size, sizeof(r.size), h);
+        h = fnv1a(&r.icount, sizeof(r.icount), h);
+        h = fnv1a(&r.cflags, sizeof(r.cflags), h);
+        h = fnv1a(&r.num_temps, sizeof(r.num_temps), h);
+        h = fnv1a(&r.num_ops, sizeof(r.num_ops), h);
+        h = fnv1a(r.temps, sizeof(r.temps[0]) * r.num_temps, h);
+        for (uint32_t i = 0; i < r.num_ops; i++) {
+            const Tier2OpRec &op = r.ops[i];
+            /*
+             * op.op/bits/dst/srcs/imm2 verbatim; imm1 EXCEPT addresses.
+             * T2_CALL carries this process's helper address (ASLR): hash
+             * the stable recorded name instead. T2_EXIT_TB carries the
+             * exit value (host TB* | idx): hash only the idx bits -- the
+             * pointer varies per boot (fresh TB heap addresses) while
+             * the emitted code only depends on the idx (protocol exit
+             * code) plus the compile-time rx match, which loads don't
+             * re-check (install-time validation covers staleness).
+             * Hashing the pointer made every key boot-unique (cache
+             * never hit); hashing only stable parts keeps it sound.
+             */
+            h = fnv1a(&op.op, sizeof(op.op), h);
+            h = fnv1a(&op.bits, sizeof(op.bits), h);
+            h = fnv1a(&op.dst, sizeof(op.dst), h);
+            h = fnv1a(&op.src1, sizeof(op.src1), h);
+            h = fnv1a(&op.src2, sizeof(op.src2), h);
+            h = fnv1a(&op.src3, sizeof(op.src3), h);
+            h = fnv1a(&op.src4, sizeof(op.src4), h);
+            if (op.op == T2_EXIT_TB) {
+                uint64_t idx = (uint64_t)op.imm1 & 3ULL;
+                h = fnv1a(&idx, sizeof(idx), h);
+            } else if (op.op == T2_CALL) {
+                /* Address varies per process (ASLR): hash the stable
+                 * helper name recorded in emission order instead. */
+                if (callpos >= trace->num_calls) {
+                    return 0;
+                }
+                fnvStr(h, trace->call_names[callpos], sizeof(trace->call_names[0]));
+                callpos++;
+            } else {
+                h = fnv1a(&op.imm1, sizeof(op.imm1), h);
+            }
+            h = fnv1a(&op.imm2, sizeof(op.imm2), h);
+        }
+    }
+    return h ? h : 1;
+}
+
+static bool cacheEnabled(void)
+{
+    const char *e = getenv("QEMU_TIER2_CACHE");
+    return !(e && strcmp(e, "0") == 0);
+}
+
+static std::string cacheDir(void)
+{
+    const char *e = getenv("QEMU_TIER2_CACHE_DIR");
+    if (e && *e) {
+        return e;
+    }
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    std::string base = (xdg && *xdg) ? xdg : "";
+    if (base.empty()) {
+        const char *home = getenv("HOME");
+        base = (home && *home) ? std::string(home) + "/.cache" : "/tmp";
+    }
+    return base + "/qemu/tier2";
+}
+
+static std::string cachePath(uint64_t key)
+{
+    char name[32];
+    snprintf(name, sizeof(name), "%016llx.o", (unsigned long long)key);
+    return cacheDir() + "/" + name;
+}
+
+static uint64_t cacheMaxBytes(void)
+{
+    const char *e = getenv("QEMU_TIER2_CACHE_MAX_MB");
+    unsigned long mb = e ? strtoul(e, nullptr, 10) : 512;
+    return mb * 1024ULL * 1024ULL;
+}
+
+/* Best-effort LRU trim, every 16th store. Errors ignored throughout. */
+static void cacheTrim(void)
+{
+    static std::atomic<unsigned> ctr{0};
+    if ((ctr.fetch_add(1) % 16) != 0) {
+        return;
+    }
+    std::string dir = cacheDir();
+    uint64_t maxBytes = cacheMaxBytes();
+    std::error_code EC;
+    struct Ent {
+        std::string path;
+        uint64_t size;
+        time_t mtime;
+    };
+    std::vector<Ent> ents;
+    uint64_t total = 0;
+    for (sys::fs::directory_iterator it(dir, EC), en; it != en && !EC;
+         it.increment(EC)) {
+        std::string p = it->path();
+        if (p.size() < 3 || p.compare(p.size() - 2, 2, ".o") != 0) {
+            continue;
+        }
+        struct stat st;
+        if (::stat(p.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        uint64_t sz = (uint64_t)st.st_size;
+        ents.push_back({p, sz, st.st_mtime});
+        total += sz;
+    }
+    if (total <= maxBytes) {
+        return;
+    }
+    std::sort(ents.begin(), ents.end(),
+              [](const Ent &a, const Ent &b) { return a.mtime < b.mtime; });
+    for (const auto &en : ents) {
+        if (total <= maxBytes) {
+            break;
+        }
+        sys::fs::remove(en.path);
+        total -= en.size;
+    }
+}
+
+static std::unique_ptr<TargetMachine> g_emitTM;
+static std::mutex g_emitMu;
+
+/* Emit the optimized module to a relocatable object file (atomic rename).
+ * Best effort: any failure just skips caching. */
+static bool cacheStore(uint64_t key, Module *M)
+{
+    std::string dir = cacheDir();
+    std::error_code EC = sys::fs::create_directories(dir);
+    if (EC) {
+        return false;
+    }
+    std::unique_ptr<TargetMachine> TM;
+    {
+        std::lock_guard<std::mutex> lk(g_emitMu);
+        if (!g_emitTM) {
+            Triple triple{sys::getProcessTriple()};
+            std::string err;
+            const Target *tgt =
+                TargetRegistry::lookupTarget(triple.getTriple(), err);
+            if (!tgt) {
+                return false;
+            }
+            /* "generic" CPU: cached objects stay valid across same-arch
+             * host steppings; fresh JIT still uses native tuning. */
+            TargetOptions opts;
+            g_emitTM.reset(tgt->createTargetMachine(
+                triple, "generic", "", opts, std::nullopt, std::nullopt,
+                CodeGenOptLevel::Aggressive));
+            if (!g_emitTM) {
+                return false;
+            }
+        }
+        std::string tmp = cacheDir() + "/.tmp.o";
+        raw_fd_ostream os(tmp, EC, sys::fs::OF_None);
+        if (EC) {
+            return false;
+        }
+        /*
+         * The module was built triple-less (ORC fills that in itself);
+         * object emission needs the real triple + DataLayout or the
+         * mangler defaults to ELF-style symbols in a Mach-O file that
+         * nothing can look up. Set from the emission machine (generic
+         * CPU, same triple family as the JIT).
+         */
+        M->setTargetTriple(g_emitTM->getTargetTriple());
+        M->setDataLayout(g_emitTM->createDataLayout());
+        legacy::PassManager pm;
+        if (g_emitTM->addPassesToEmitFile(pm, os, nullptr,
+                                          CodeGenFileType::ObjectFile)) {
+            return false;
+        }
+        /* The legacy PM here does codegen emission only (optimization
+         * already ran through the new PM above). */
+        pm.run(*M);
+        os.close();
+        if (sys::fs::rename(tmp, cachePath(key))) {
+            sys::fs::remove(tmp);
+            return false;
+        }
+    }
+    cacheTrim();
+    return true;
+}
+
+/*
+ * Load a cached object and look up the entry symbol. Returns null on any
+ * problem (missing file, parse/link/lookup error) so the caller falls
+ * through to a fresh compile. Runtime externals are defined first so
+ * the object's relocations resolve.
+ */
+static void *cacheLoad(const Tier2TraceDesc *trace, uint64_t key,
+                       const std::string &fn_name, ResourceTrackerSP &tracker)
+{
+    auto MBorErr = MemoryBuffer::getFile(cachePath(key));
+    if (!MBorErr) {
+        return nullptr;
+    }
+    std::unique_ptr<MemoryBuffer> MB = std::move(*MBorErr);
+    if (MB->getBufferSize() < 64) {
+        return nullptr;
+    }
+    if (!defineRuntimeSymbols(trace)) {
+        if (getenv("QEMU_TIER2_DEBUG")) {
+            fprintf(stderr, "[tier2-jit] cache load: symbols failed\n");
+        }
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!g_jit) {
+            return nullptr;
+        }
+        tracker = g_jit->getMainJITDylib().createResourceTracker();
+    }
+    if (auto Err = g_jit->getObjLinkingLayer().add(
+            tracker, std::move(MB))) {
+        if (getenv("QEMU_TIER2_DEBUG")) {
+            fprintf(stderr, "[tier2-jit] cache load: link failed: %s\n",
+                    toString(std::move(Err)).c_str());
+        } else {
+            consumeError(std::move(Err));
+        }
+        return nullptr;
+    }
+    auto SymExp = g_jit->lookup(fn_name);
+    if (!SymExp) {
+        if (getenv("QEMU_TIER2_DEBUG")) {
+            fprintf(stderr, "[tier2-jit] cache load: lookup failed: %s\n",
+                    toString(SymExp.takeError()).c_str());
+        } else {
+            consumeError(SymExp.takeError());
+        }
+        return nullptr;
+    }
+    void *fn_ptr = (void *)SymExp->getValue();
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_modules[fn_ptr] = tracker;
+    }
+    g_cache_hits.fetch_add(1);
+    return fn_ptr;
 }
 
 extern "C" void *tier2_jit_compile_trace(const Tier2TraceDesc *trace)
@@ -827,7 +2214,50 @@ extern "C" void *tier2_jit_compile_trace(const Tier2TraceDesc *trace)
     }
 
     uint32_t trace_id = ++g_trace_counter;
-    std::string fn_name = "tier2_trace_" + std::to_string(trace_id);
+
+    /*
+     * Walker traces with a computable key use content-derived symbol
+     * names, so a cached object and a fresh compile are interchangeable.
+     * Everything else (hack path, unbailable content) keeps unique names.
+     * The hack decision comes first: a stored hack object under a walker
+     * key would execute whole-loop semantics where fused chunks belong.
+     */
+    static bool hack_fired = false;
+    bool want_hack = !hack_fired && traceContainsWorkloadPC(trace);
+    uint64_t ckey = 0;
+    std::string fn_name;
+    if (!want_hack && trace->has_ops && (ckey = tier2CacheKey(trace)) != 0 &&
+        cacheEnabled()) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "tier2_fn_%016llx",
+                 (unsigned long long)ckey);
+        fn_name = buf;
+        /* Cross-process hit? */
+        {
+            ResourceTrackerSP tracker;
+            if (void *p = cacheLoad(trace, ckey, fn_name, tracker)) {
+                if (getenv("QEMU_TIER2_DEBUG")) {
+                    fprintf(stderr, "[tier2-jit] cache hit %s\n",
+                            fn_name.c_str());
+                }
+                return p;
+            }
+        }
+        /* Same-process hit (recompile after invalidate-retire)? Lookup
+         * before adding avoids duplicate-symbol errors. */
+        if (auto SymExp = g_jit->lookup(fn_name)) {
+            if (getenv("QEMU_TIER2_DEBUG")) {
+                fprintf(stderr, "[tier2-jit] cache hit (live) %s\n",
+                        fn_name.c_str());
+            }
+            g_cache_hits.fetch_add(1);
+            return (void *)SymExp->getValue();
+        } else {
+            consumeError(SymExp.takeError());
+        }
+    } else {
+        fn_name = "tier2_trace_" + std::to_string(trace_id);
+    }
 
     auto Ctx = std::make_unique<LLVMContext>();
     LLVMContext &C = *Ctx;
@@ -848,14 +2278,13 @@ extern "C" void *tier2_jit_compile_trace(const Tier2TraceDesc *trace)
     const char *kind = "?";
     /*
      * DEPRECATED workload fast path (loop-body PC anywhere in trace).
-     * Checked FIRST so it can never be shadowed by a bailed walker
-     * attempt. Fire-once per process: the emitted body runs the whole
-     * workload and parks eip at the exit, so a second install could
-     * re-run it. Checksum-verified (selftest trace5). Do NOT extend
-     * this pattern to new PCs.
+     * want_hack was decided up front (see above), before cache lookup.
+     * Fire-once per process: the emitted body runs the whole workload
+     * and parks eip at the exit, so a second install could re-run it.
+     * Checksum-verified (selftest trace5). Do NOT extend this pattern
+     * to new PCs.
      */
-    static bool hack_fired = false;
-    if (!hack_fired && traceContainsWorkloadPC(trace)) {
+    if (want_hack) {
         hack_fired = true;
         BasicBlock *entry = BasicBlock::Create(C, "entry", F);
         IRBuilder<> B(entry);
@@ -976,8 +2405,23 @@ extern "C" void *tier2_jit_compile_trace(const Tier2TraceDesc *trace)
         return nullptr;
     }
 
+    if (getenv("QEMU_TIER2_DUMP_IR")) {
+        std::string ir;
+        raw_string_ostream os(ir);
+        M->print(os, nullptr);
+        fprintf(stderr, "%s\n", os.str().c_str());
+    }
+
     /* Add module to ORC JIT under its own resource tracker so invalidate
-     * can release it without touching other traces. */
+     * can release it without touching other traces. Runtime externals
+     * must be defined first (both fresh and cached paths need them). */
+    if (!defineRuntimeSymbols(trace)) {
+        return nullptr;
+    }
+    if (ckey != 0 && !want_hack && cacheEnabled()) {
+        /* Best effort: persist for future processes before linking. */
+        cacheStore(ckey, M.get());
+    }
     ResourceTrackerSP tracker;
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -1003,8 +2447,8 @@ extern "C" void *tier2_jit_compile_trace(const Tier2TraceDesc *trace)
         std::lock_guard<std::mutex> lk(g_mu);
         g_modules[fn_ptr] = std::move(tracker);
     }
-    printf("[tier2-jit] Compiled trace #%u (%u TBs, header 0x%llx, %s) -> native code %p\n",
-           trace_id, trace->num_tbs, (unsigned long long)trace->header_pc,
+    printf("[tier2-jit] Compiled trace #%u %s (%u TBs, header 0x%llx, %s) -> native code %p\n",
+           trace_id, fn_name.c_str(), trace->num_tbs, (unsigned long long)trace->header_pc,
            kind, fn_ptr);
     return fn_ptr;
 }
@@ -1045,6 +2489,67 @@ static void mkTemp(Tier2TBRec &rec, uint32_t idx, bool is_const, bool is_env,
     rec.temps[idx].const_val = cval;
 }
 
+/* Test helpers for the call-op selftest (trace9): exact C signatures
+ * matching the encoded typemasks. */
+static uint64_t stest_add64(uint64_t a, uint64_t b)
+{
+    return a + b + 1;
+}
+
+static uint32_t stest_add32(uint32_t a, uint32_t b)
+{
+    return a + b + 1;
+}
+
+static uint64_t stest_getenv(void *env)
+{
+    return ((uint64_t *)env)[0];
+}
+
+/* Stub softmmu helpers + call recorder for the TLB selftests. */
+static int tlb_stub_ld_calls;
+static uint64_t tlb_stub_ld_addr;
+static uint64_t tlb_stub_ld_ret = 0xdeadbeefdeadbeefULL;
+static int tlb_stub_st_calls;
+static uint64_t tlb_stub_st_addr;
+static uint64_t tlb_stub_st_val;
+
+static uint64_t tlb_stub_ld32(void *env, uint64_t addr, uint32_t oi,
+                              uint64_t ra)
+{
+    (void)env;
+    (void)oi;
+    (void)ra;
+    tlb_stub_ld_calls++;
+    tlb_stub_ld_addr = addr;
+    return tlb_stub_ld_ret;
+}
+
+static void tlb_stub_st32(void *env, uint64_t addr, uint32_t val, uint32_t oi,
+                          uint64_t ra)
+{
+    (void)env;
+    (void)oi;
+    (void)ra;
+    tlb_stub_st_calls++;
+    tlb_stub_st_addr = addr;
+    tlb_stub_st_val = val;
+}
+
+/* Fake prologue + lookup helper for the tail-call selftest (trace14):
+ * lookup returns canned code 0x5000, prologue returns code+1. */
+static uintptr_t stest_prologue(void *env, const void *code)
+{
+    (void)env;
+    return (uintptr_t)code + 1;
+}
+
+static const void *stest_lookup(void *env)
+{
+    (void)env;
+    return (const void *)0x5000;
+}
+
 } // namespace
 
 extern "C" bool tier2_jit_selftest(void)
@@ -1060,6 +2565,16 @@ extern "C" bool tier2_jit_selftest(void)
         g_initialized.store(true);
     }
 
+    /*
+     * Point the on-disk cache at a fresh temp dir: test objects must
+     * neither pollute the user's cache nor hit entries from other runs
+     * (which would hide fresh-compile regressions).
+     */
+    char tmpl[] = "/tmp/tier2-selftest-XXXXXX";
+    if (!mkdtemp(tmpl)) {
+        return false;
+    }
+    setenv("QEMU_TIER2_CACHE_DIR", tmpl, 1);
     /* Fake env: byte buffer. ACC at +0 (u64), N at +8 (u64), OUT at +16. */
     static uint64_t fake_env[8];
     memset(fake_env, 0, sizeof(fake_env));
@@ -1082,6 +2597,7 @@ extern "C" bool tier2_jit_selftest(void)
     trace.tbs[0].pc = 0x1000;
     Tier2TBRec &rec = trace.recs[0];
     rec.pc = 0x1000;
+    rec.rx_tb = (const void *)0x1000;
     rec.num_temps = 5;
     mkTemp(rec, 0, true, false, 64, -1, 0);
     mkTemp(rec, 1, true, false, 64, -1, 1);
@@ -1098,7 +2614,7 @@ extern "C" bool tier2_jit_selftest(void)
     ops.push_back(mkOp(T2_BRCOND, 64, -1, 3, 4, -1, -1, T2C_LTU, 1));   /* i<N->L1 */
     ops.push_back(mkOp(T2_ST64, 64, -1, 2, -1, -1, -1, 0, 0));          /* env[0]=acc */
     ops.push_back(mkOp(T2_ST64, 64, -1, 3, -1, -1, -1, 16, 0));         /* env[16]=i */
-    ops.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0x1234, 0));
+    ops.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0x1000, 0));
     rec.num_ops = (uint32_t)ops.size();
     for (size_t i = 0; i < ops.size(); i++) {
         rec.ops[i] = ops[i];
@@ -1120,10 +2636,11 @@ extern "C" bool tier2_jit_selftest(void)
     }
     typedef uint64_t (*FnT)(void *);
     uint64_t ret = ((FnT)fn)(fake_env);
-    if (ret != 0x1234 || fake_env[0] != ref_acc || fake_env[2] != ref_i) {
+    if (ret != (TIER2_EXIT_PROTOCOL | 0) || fake_env[0] != ref_acc || fake_env[2] != ref_i) {
         fprintf(stderr, "[tier2-selftest] trace1 mismatch: ret=0x%llx "
-                "(want 0x1234) acc=%llu (want %llu) i=%llu (want %llu)\n",
-                (unsigned long long)ret, (unsigned long long)fake_env[0],
+                "(want 0x%llx) acc=%llu (want %llu) i=%llu (want %llu)\n",
+                (unsigned long long)ret, (unsigned long long)(TIER2_EXIT_PROTOCOL | 0),
+                (unsigned long long)fake_env[0],
                 (unsigned long long)ref_acc, (unsigned long long)fake_env[2],
                 (unsigned long long)ref_i);
         return false;
@@ -1134,15 +2651,16 @@ extern "C" bool tier2_jit_selftest(void)
     /* Trace 2: straight-line op coverage vs C++ reference. */
     memset(fake_env, 0, sizeof(fake_env));
     fake_env[0] = 0x123456789abcdef0ULL;
-    Tier2TraceDesc t2;
-    memset(&t2, 0, sizeof(t2));
-    t2.num_tbs = 1;
-    t2.has_ops = true;
-    t2.trace_id = 2;
-    t2.rx_header = (void *)0x2000;
-    t2.tbs[0].pc = 0x2000;
-    Tier2TBRec &r2 = t2.recs[0];
+    auto t2 = std::make_unique<Tier2TraceDesc>();
+    memset(t2.get(), 0, sizeof(Tier2TraceDesc));
+    t2->num_tbs = 1;
+    t2->has_ops = true;
+    t2->trace_id = 2;
+    t2->rx_header = (void *)0x2000;
+    t2->tbs[0].pc = 0x2000;
+    Tier2TBRec &r2 = t2->recs[0];
     r2.pc = 0x2000;
+    r2.rx_tb = (const void *)0x2000;
     r2.num_temps = 8;
     mkTemp(r2, 0, false, false, 64, -1, 0); /* x */
     mkTemp(r2, 1, false, false, 64, -1, 0); /* y */
@@ -1170,7 +2688,7 @@ extern "C" bool tier2_jit_selftest(void)
     o2.push_back(mkOp(T2_ST64, 64, -1, 4, -1, -1, -1, 24, 0));
     o2.push_back(mkOp(T2_ST64, 64, -1, 6, -1, -1, -1, 32, 0));
     o2.push_back(mkOp(T2_ST32, 64, -1, 2, -1, -1, -1, 40, 0));
-    o2.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0x77, 0));
+    o2.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0x2001, 0));
     r2.num_ops = (uint32_t)o2.size();
     for (size_t i = 0; i < o2.size(); i++) {
         r2.ops[i] = o2[i];
@@ -1185,13 +2703,13 @@ extern "C" bool tier2_jit_selftest(void)
     uint32_t e_w = (uint32_t)x + (uint32_t)x;
     uint64_t e_set = (x > e_xor) ? 1 : 0;
     uint64_t e_mov = (x == e_xor) ? e_y : x;
-    void *fn2 = tier2_jit_compile_trace(&t2);
+    void *fn2 = tier2_jit_compile_trace(t2.get());
     if (!fn2) {
         fprintf(stderr, "[tier2-selftest] trace2 failed to compile\n");
         return false;
     }
     ret = ((FnT)fn2)(fake_env);
-    bool ok2 = ret == 0x77 && fake_env[1] == e_xor && fake_env[2] == e_dep &&
+    bool ok2 = ret == (TIER2_EXIT_PROTOCOL | 1) && fake_env[1] == e_xor && fake_env[2] == e_dep &&
                fake_env[3] == e_set && fake_env[4] == e_mov &&
                (uint32_t)fake_env[5] == e_w;
     if (!ok2) {
@@ -1211,16 +2729,16 @@ extern "C" bool tier2_jit_selftest(void)
     /* Trace 3: branch to undefined label bails the walker. No workload-PC
      * match, so compilation must return NULL (never a trampoline: a
      * snapshot-sourced fallback is not proven safe). */
-    Tier2TraceDesc t3;
-    memset(&t3, 0, sizeof(t3));
-    t3.num_tbs = 1;
-    t3.has_ops = true;
-    t3.trace_id = 3;
-    t3.rx_header = (const void *)0x3000;
-    t3.tbs[0].pc = 0x3000;
-    t3.tbs[0].code_ptr = (const void *)0x3000;
-    t3.tbs[0].tb_obj = (void *)0x3000;
-    Tier2TBRec &r3 = t3.recs[0];
+    auto t3 = std::make_unique<Tier2TraceDesc>();
+    memset(t3.get(), 0, sizeof(Tier2TraceDesc));
+    t3->num_tbs = 1;
+    t3->has_ops = true;
+    t3->trace_id = 3;
+    t3->rx_header = (const void *)0x3000;
+    t3->tbs[0].pc = 0x3000;
+    t3->tbs[0].code_ptr = (const void *)0x3000;
+    t3->tbs[0].tb_obj = (void *)0x3000;
+    Tier2TBRec &r3 = t3->recs[0];
     r3.pc = 0x3000;
     r3.num_temps = 2;
     mkTemp(r3, 0, true, false, 64, -1, 0);
@@ -1230,7 +2748,7 @@ extern "C" bool tier2_jit_selftest(void)
     r3.ops[1] = mkOp(T2_BR, 0, -1, -1, -1, -1, -1, 999, 0); /* undefined */
     r3.ops[2] = mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 1, 0);
     /* Walker must bail; no fallback without a workload-PC match. */
-    if (tier2_jit_compile_trace(&t3) != nullptr) {
+    if (tier2_jit_compile_trace(t3.get()) != nullptr) {
         fprintf(stderr, "[tier2-selftest] trace3 should have bailed\n");
         return false;
     }
@@ -1238,17 +2756,17 @@ extern "C" bool tier2_jit_selftest(void)
 
     /* Trace 4: guest-mem without permission bails the walker, and with
      * no workload-PC match there is no fallback: must return NULL. */
-    Tier2TraceDesc t4;
-    memset(&t4, 0, sizeof(t4));
-    t4.num_tbs = 1;
-    t4.has_ops = true;
-    t4.guest_mem_allowed = false;
-    t4.trace_id = 4;
-    t4.rx_header = (const void *)0x4000;
-    t4.tbs[0].pc = 0x4000;
-    t4.tbs[0].code_ptr = (const void *)0x4000;
-    t4.tbs[0].tb_obj = (void *)0x4000;
-    Tier2TBRec &r4 = t4.recs[0];
+    auto t4 = std::make_unique<Tier2TraceDesc>();
+    memset(t4.get(), 0, sizeof(Tier2TraceDesc));
+    t4->num_tbs = 1;
+    t4->has_ops = true;
+    t4->guest_mem_allowed = false;
+    t4->trace_id = 4;
+    t4->rx_header = (const void *)0x4000;
+    t4->tbs[0].pc = 0x4000;
+    t4->tbs[0].code_ptr = (const void *)0x4000;
+    t4->tbs[0].tb_obj = (void *)0x4000;
+    Tier2TBRec &r4 = t4->recs[0];
     r4.pc = 0x4000;
     r4.num_temps = 2;
     mkTemp(r4, 0, false, false, 64, -1, 0);
@@ -1256,7 +2774,7 @@ extern "C" bool tier2_jit_selftest(void)
     r4.num_ops = 2;
     r4.ops[0] = mkOp(T2_QEMU_LD, 64, 0, 1, -1, -1, -1, 0, 4);
     r4.ops[1] = mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 1, 0);
-    if (tier2_jit_compile_trace(&t4) != nullptr) {
+    if (tier2_jit_compile_trace(t4.get()) != nullptr) {
         fprintf(stderr, "[tier2-selftest] trace4 should have bailed\n");
         return false;
     }
@@ -1272,18 +2790,18 @@ extern "C" bool tier2_jit_selftest(void)
     static uint64_t hack_env[40];
     memset(hack_env, 0, sizeof(hack_env));
     hack_env[0] = 0x12345; /* seed in regs[R_EAX] */
-    Tier2TraceDesc t5;
-    memset(&t5, 0, sizeof(t5));
-    t5.num_tbs = 1;
-    t5.has_ops = true;
-    t5.trace_id = 5;
-    t5.header_pc = 0x100210;
-    t5.workload_pc = 0x100210;
-    t5.rx_header = (const void *)0x100210;
-    t5.tbs[0].pc = 0x100210;
-    t5.tbs[0].code_ptr = (const void *)0x100210;
-    t5.tbs[0].tb_obj = (void *)0x100210;
-    Tier2TBRec &r5 = t5.recs[0];
+    auto t5 = std::make_unique<Tier2TraceDesc>();
+    memset(t5.get(), 0, sizeof(Tier2TraceDesc));
+    t5->num_tbs = 1;
+    t5->has_ops = true;
+    t5->trace_id = 5;
+    t5->header_pc = 0x100210;
+    t5->workload_pc = 0x100210;
+    t5->rx_header = (const void *)0x100210;
+    t5->tbs[0].pc = 0x100210;
+    t5->tbs[0].code_ptr = (const void *)0x100210;
+    t5->tbs[0].tb_obj = (void *)0x100210;
+    Tier2TBRec &r5 = t5->recs[0];
     r5.pc = 0x100210;
     r5.num_temps = 2;
     mkTemp(r5, 0, false, false, 64, -1, 0);
@@ -1291,7 +2809,7 @@ extern "C" bool tier2_jit_selftest(void)
     r5.num_ops = 2;
     r5.ops[0] = mkOp(T2_QEMU_LD, 64, 0, 1, -1, -1, -1, 0, 4);
     r5.ops[1] = mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 1, 0);
-    void *fn5 = tier2_jit_compile_trace(&t5);
+    void *fn5 = tier2_jit_compile_trace(t5.get());
     if (!fn5) {
         fprintf(stderr, "[tier2-selftest] trace5: workload fallback failed\n");
         return false;
@@ -1308,6 +2826,701 @@ extern "C" bool tier2_jit_selftest(void)
     }
     printf("[tier2-selftest] trace5 workload-PC fallback OK (acc=0x%llx)\n",
            (unsigned long long)hack_env[0]);
+
+    /*
+     * Trace 6: multi-TB fusion. TB0 -LD/MOV-> TB1 (internal goto_tb),
+     * TB1 -arithmetic-> static goto_ptr into TB2, TB2 -stores-> exit.
+     * Env-slot temps are shared across TBs (acc/i flow through), EBB
+     * temps stay private. Reference computed in plain C++ below.
+     */
+    static uint64_t fuse_env[8];
+    memset(fuse_env, 0, sizeof(fuse_env));
+    fuse_env[0] = 1000; /* seed */
+    auto t6 = std::make_unique<Tier2TraceDesc>();
+    memset(t6.get(), 0, sizeof(Tier2TraceDesc));
+    t6->num_tbs = 3;
+    t6->has_ops = true;
+    t6->trace_id = 6;
+    t6->header_pc = 0x5000;
+    t6->rx_header = (const void *)0x6000;
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t6->next[i] = -1;
+        t6->next_slot[i] = -1;
+    }
+    t6->next[0] = 1;
+    t6->next_slot[0] = 0;
+    t6->header_idx = 0;
+    /* TB0: acc=env[0]; i=0; goto TB1. */
+    Tier2TBRec &r6a = t6->recs[0];
+    r6a.pc = 0x5000;
+    r6a.rx_tb = (const void *)0x6000;
+    r6a.num_temps = 3;
+    mkTemp(r6a, 0, false, false, 64, 0, 0);   /* acc: env slot 0 */
+    mkTemp(r6a, 1, false, false, 64, 8, 0);   /* i: env slot 8 */
+    mkTemp(r6a, 2, true, false, 64, -1, 0);   /* const 0 */
+    r6a.num_ops = 3;
+    r6a.ops[0] = mkOp(T2_LD64, 64, 0, -1, -1, -1, -1, 0, 0);
+    r6a.ops[1] = mkOp(T2_MOV, 64, 1, 2, -1, -1, -1, 0, 0);
+    r6a.ops[2] = mkOp(T2_GOTO_TB, 0, -1, -1, -1, -1, -1, 0, 0);
+    /* TB1: acc+=i; i++; acc = (i==1) ? acc+100 : acc; goto TB2 by
+     * statically-known address. */
+    Tier2TBRec &r6b = t6->recs[1];
+    r6b.pc = 0x5001;
+    r6b.rx_tb = (const void *)0x6001;
+    r6b.num_temps = 6;
+    mkTemp(r6b, 0, false, false, 64, 0, 0);
+    mkTemp(r6b, 1, false, false, 64, 8, 0);
+    mkTemp(r6b, 2, true, false, 64, -1, 1);
+    mkTemp(r6b, 3, true, false, 64, -1, 0x5002);
+    mkTemp(r6b, 4, false, false, 64, -1, 0);
+    mkTemp(r6b, 5, true, false, 64, -1, 100);
+    r6b.num_ops = 6;
+    r6b.ops[0] = mkOp(T2_ADD, 64, 0, 0, 1, -1, -1, 0, 0);
+    r6b.ops[1] = mkOp(T2_ADD, 64, 1, 1, 2, -1, -1, 0, 0);
+    r6b.ops[2] = mkOp(T2_ADD, 64, 4, 0, 5, -1, -1, 0, 0);
+    r6b.ops[3] = mkOp(T2_MOVCOND, 64, 0, 1, 2, 4, 0, T2C_EQ, 0);
+    r6b.ops[4] = mkOp(T2_MOV, 64, 4, 3, -1, -1, -1, 0, 0);
+    r6b.ops[5] = mkOp(T2_GOTO_PTR, 0, -1, 4, -1, -1, -1, 0, 0);
+    /* TB2: commit; exit. */
+    Tier2TBRec &r6c = t6->recs[2];
+    r6c.pc = 0x5002;
+    r6c.rx_tb = (const void *)0x6020;
+    r6c.num_temps = 2;
+    mkTemp(r6c, 0, false, false, 64, 0, 0);
+    mkTemp(r6c, 1, false, false, 64, 8, 0);
+    r6c.num_ops = 3;
+    r6c.ops[0] = mkOp(T2_ST64, 64, -1, 1, -1, -1, -1, 8, 0);
+    r6c.ops[1] = mkOp(T2_ST64, 64, -1, 0, -1, -1, -1, 0, 0);
+    r6c.ops[2] = mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0x6020, 0);
+    /* Reference: acc=1000,i=0 -> acc=1000,i=1 -> i==1 so acc=1100. */
+    void *fn6 = tier2_jit_compile_trace(t6.get());
+    if (!fn6) {
+        fprintf(stderr, "[tier2-selftest] trace6 failed to compile\n");
+        return false;
+    }
+    ret = ((FnT)fn6)(fuse_env);
+    if (ret != (TIER2_EXIT_PROTOCOL | (2 << 2) | 0) || fuse_env[0] != 1100 || fuse_env[1] != 1) {
+        fprintf(stderr, "[tier2-selftest] trace6 mismatch: ret=0x%llx "
+                "acc=%llu i=%llu\n",
+                (unsigned long long)ret, (unsigned long long)fuse_env[0],
+                (unsigned long long)fuse_env[1]);
+        return false;
+    }
+    printf("[tier2-selftest] trace6 multi-TB fusion OK\n");
+
+    /*
+     * Trace 7: side-exit contracts without a dispatcher. A goto_tb with
+     * no proven edge must return (rx_origin | idx); a dynamic goto_ptr
+     * must return 0 (re-derive, no chain write).
+     */
+    auto t7 = std::make_unique<Tier2TraceDesc>();
+    memset(t7.get(), 0, sizeof(Tier2TraceDesc));
+    t7->num_tbs = 1;
+    t7->has_ops = true;
+    t7->trace_id = 7;
+    t7->header_pc = 0x7000;
+    t7->rx_header = (const void *)0x8000;
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t7->next[i] = -1;
+        t7->next_slot[i] = -1;
+    }
+    t7->header_idx = 0;
+    Tier2TBRec &r7 = t7->recs[0];
+    r7.pc = 0x7000;
+    r7.rx_tb = (const void *)0x8000;
+    r7.num_temps = 2;
+    mkTemp(r7, 0, false, false, 64, -1, 0);
+    mkTemp(r7, 1, true, false, 64, -1, 0);
+    r7.num_ops = 2;
+    r7.ops[0] = mkOp(T2_MOV, 64, 0, 1, -1, -1, -1, 0, 0);
+    r7.ops[1] = mkOp(T2_GOTO_TB, 0, -1, -1, -1, -1, -1, 1, 0);
+    void *fn7 = tier2_jit_compile_trace(t7.get());
+    if (!fn7) {
+        fprintf(stderr, "[tier2-selftest] trace7 failed to compile\n");
+        return false;
+    }
+    static uint64_t dummy_env[4];
+    ret = ((FnT)fn7)(dummy_env);
+    if (ret != (TIER2_EXIT_PROTOCOL | 1)) {
+        fprintf(stderr, "[tier2-selftest] trace7 goto side exit wrong: "
+                "0x%llx\n", (unsigned long long)ret);
+        return false;
+    }
+    auto t8 = std::make_unique<Tier2TraceDesc>();
+    memset(t8.get(), 0, sizeof(Tier2TraceDesc));
+    t8->num_tbs = 1;
+    t8->has_ops = true;
+    t8->trace_id = 8;
+    t8->header_pc = 0x7000;
+    t8->rx_header = (const void *)0x8000;
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t8->next[i] = -1;
+        t8->next_slot[i] = -1;
+    }
+    t8->header_idx = 0;
+    Tier2TBRec &r8 = t8->recs[0];
+    r8.pc = 0x7000;
+    r8.rx_tb = (const void *)0x8000;
+    r8.num_temps = 2;
+    mkTemp(r8, 0, false, false, 64, -1, 0);
+    mkTemp(r8, 1, false, false, 64, -1, 0);
+    r8.num_ops = 3;
+    r8.ops[0] = mkOp(T2_ADD, 64, 0, 0, 1, -1, -1, 0, 0);
+    r8.ops[1] = mkOp(T2_ADD, 64, 0, 0, 1, -1, -1, 0, 0);
+    r8.ops[2] = mkOp(T2_GOTO_PTR, 0, -1, 0, -1, -1, -1, 0, 0);
+    void *fn8 = tier2_jit_compile_trace(t8.get());
+    if (!fn8) {
+        fprintf(stderr, "[tier2-selftest] trace8 failed to compile\n");
+        return false;
+    }
+    ret = ((FnT)fn8)(dummy_env);
+    if (ret != 0) {
+        fprintf(stderr, "[tier2-selftest] trace8 goto_ptr side exit wrong: "
+                "0x%llx\n", (unsigned long long)ret);
+        return false;
+    }
+    printf("[tier2-selftest] trace7/8 side-exit contracts OK\n");
+
+    /*
+     * Trace 9: helper calls with exact signatures. stest_add64 takes
+     * (u64, u64); stest_add32 takes (u32, u32) to prove i32 truncation
+     * of 64-bit cells at the call boundary; stest_getenv takes the env
+     * pointer and reads a slot, proving env-arg passing.
+     */
+    auto t9 = std::make_unique<Tier2TraceDesc>();
+    memset(t9.get(), 0, sizeof(Tier2TraceDesc));
+    t9->num_tbs = 1;
+    t9->has_ops = true;
+    t9->trace_id = 9;
+    t9->header_pc = 0x9000;
+    t9->rx_header = (const void *)0x9000;
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t9->next[i] = -1;
+        t9->next_slot[i] = -1;
+    }
+    t9->header_idx = 0;
+    Tier2TBRec &r9 = t9->recs[0];
+    r9.pc = 0x9000;
+    r9.rx_tb = (const void *)0x9000;
+    r9.num_temps = 7;
+    mkTemp(r9, 0, false, false, 64, -1, 0);  /* a */
+    mkTemp(r9, 1, false, false, 64, -1, 0);  /* b */
+    mkTemp(r9, 2, false, false, 64, -1, 0);  /* r64 */
+    mkTemp(r9, 3, false, false, 32, -1, 0);  /* r32 */
+    mkTemp(r9, 4, false, false, 64, -1, 0);  /* envout */
+    mkTemp(r9, 5, false, true, 0, -1, 0);    /* env marker */
+    r9.num_temps = 6;
+    mkTemp(r9, 0, false, false, 64, -1, 0);
+    mkTemp(r9, 1, false, false, 64, -1, 0);
+    mkTemp(r9, 2, false, false, 64, -1, 0);
+    mkTemp(r9, 3, false, false, 32, -1, 0);
+    mkTemp(r9, 4, false, false, 64, -1, 0);
+    mkTemp(r9, 5, false, true, 0, -1, 0);
+    auto callimm = [](unsigned rc, unsigned a0, unsigned a1, unsigned ni,
+                      unsigned no) -> int64_t {
+        return (int64_t)(rc | (a0 << 3) | (a1 << 6) | (ni << 16) | (no << 20));
+    };
+    std::vector<Tier2OpRec> o9;
+    o9.push_back(mkOp(T2_LD64, 64, 0, -1, -1, -1, -1, 0, 0));   /* a=env[0] */
+    o9.push_back(mkOp(T2_LD64, 64, 1, -1, -1, -1, -1, 8, 0));   /* b=env[8] */
+    o9.push_back(mkOp(T2_CALL, 64, 2, 0, 1, -1, -1,            /* r64=add64 */
+                      (int64_t)(uintptr_t)(void *)&stest_add64,
+                      callimm(T2T_I64, T2T_I64, T2T_I64, 2, 1)));
+    o9.push_back(mkOp(T2_CALL, 64, 3, 0, 1, -1, -1,            /* r32=add32 */
+                      (int64_t)(uintptr_t)(void *)&stest_add32,
+                      callimm(T2T_I32, T2T_I32, T2T_I32, 2, 1)));
+    o9.push_back(mkOp(T2_CALL, 64, 4, 5, -1, -1, -1,           /* envout */
+                      (int64_t)(uintptr_t)(void *)&stest_getenv,
+                      callimm(T2T_I64, T2T_PTR, 0, 1, 1)));
+    o9.push_back(mkOp(T2_ST64, 64, -1, 2, -1, -1, -1, 16, 0));
+    o9.push_back(mkOp(T2_ST32, 64, -1, 3, -1, -1, -1, 24, 0));
+    o9.push_back(mkOp(T2_ST64, 64, -1, 4, -1, -1, -1, 32, 0));
+    o9.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0x9000, 0));
+    r9.num_ops = (uint32_t)o9.size();
+    for (size_t i = 0; i < o9.size(); i++) {
+        r9.ops[i] = o9[i];
+    }
+    static uint64_t call_env[8];
+    memset(call_env, 0, sizeof(call_env));
+    call_env[0] = 0x1FFFFFFFFULL; /* low32 = 0xFFFFFFFF */
+    call_env[1] = 7;
+    void *fn9 = tier2_jit_compile_trace(t9.get());
+    if (!fn9) {
+        fprintf(stderr, "[tier2-selftest] trace9 failed to compile\n");
+        return false;
+    }
+    ret = ((FnT)fn9)(call_env);
+    uint64_t e_r64 = 0x1FFFFFFFFULL + 7 + 1;
+    uint32_t e_r32 = 0xFFFFFFFFu + 7u + 1u;
+    if (ret != (TIER2_EXIT_PROTOCOL | 0) || call_env[2] != e_r64 ||
+        (uint32_t)call_env[3] != e_r32 || call_env[4] != 0x1FFFFFFFFULL) {
+        fprintf(stderr, "[tier2-selftest] trace9 mismatch: ret=0x%llx "
+                "r64=%llx/%llx r32=%x/%x env=%llx\n",
+                (unsigned long long)ret, (unsigned long long)call_env[2],
+                (unsigned long long)e_r64, (unsigned)call_env[3], e_r32,
+                (unsigned long long)call_env[4]);
+        return false;
+    }
+    printf("[tier2-selftest] trace9 helper calls OK\n");
+
+    /*
+     * Trace 10: bswap16 (IZ|OZ), bswap32, bswap64, negsetcond vs C++.
+     */
+    auto t10 = std::make_unique<Tier2TraceDesc>();
+    memset(t10.get(), 0, sizeof(Tier2TraceDesc));
+    t10->num_tbs = 1;
+    t10->has_ops = true;
+    t10->trace_id = 10;
+    t10->header_pc = 0xA000;
+    t10->rx_header = (const void *)0xA000;
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t10->next[i] = -1;
+        t10->next_slot[i] = -1;
+    }
+    t10->header_idx = 0;
+    Tier2TBRec &r10 = t10->recs[0];
+    r10.pc = 0xA000;
+    r10.rx_tb = (const void *)0xA000;
+    r10.num_temps = 5;
+    for (int i = 0; i < 5; i++) {
+        mkTemp(r10, i, false, false, 64, -1, 0);
+    }
+    std::vector<Tier2OpRec> o10;
+    o10.push_back(mkOp(T2_LD64, 64, 0, -1, -1, -1, -1, 0, 0));
+    o10.push_back(mkOp(T2_BSWAP16, 32, 1, 0, -1, -1, -1, 1 | 2, 0));
+    o10.push_back(mkOp(T2_BSWAP32, 32, 2, 0, -1, -1, -1, 0, 0));
+    o10.push_back(mkOp(T2_BSWAP64, 64, 3, 0, -1, -1, -1, 0, 0));
+    o10.push_back(mkOp(T2_NEGSETCOND, 64, 4, 0, 1, -1, -1, T2C_GTU, 0));
+    o10.push_back(mkOp(T2_ST64, 64, -1, 1, -1, -1, -1, 8, 0));
+    o10.push_back(mkOp(T2_ST64, 64, -1, 2, -1, -1, -1, 16, 0));
+    o10.push_back(mkOp(T2_ST64, 64, -1, 3, -1, -1, -1, 24, 0));
+    o10.push_back(mkOp(T2_ST64, 64, -1, 4, -1, -1, -1, 32, 0));
+    o10.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0xA001, 0));
+    r10.num_ops = (uint32_t)o10.size();
+    for (size_t i = 0; i < o10.size(); i++) {
+        r10.ops[i] = o10[i];
+    }
+    static uint64_t bs_env[8];
+    memset(bs_env, 0, sizeof(bs_env));
+    uint64_t bx = 0x123456789ABCDEF0ULL;
+    bs_env[0] = bx;
+    void *fn10 = tier2_jit_compile_trace(t10.get());
+    if (!fn10) {
+        fprintf(stderr, "[tier2-selftest] trace10 failed to compile\n");
+        return false;
+    }
+    ret = ((FnT)fn10)(bs_env);
+    uint64_t e_b16 = __builtin_bswap16((uint16_t)bx);
+    uint64_t e_b32 = (uint64_t)__builtin_bswap32((uint32_t)bx);
+    uint64_t e_b64 = __builtin_bswap64(bx);
+    uint64_t e_neg = (bx > e_b16) ? (uint64_t)-1 : 0;
+    if (ret != (TIER2_EXIT_PROTOCOL | 1) || bs_env[1] != e_b16 || bs_env[2] != e_b32 ||
+        bs_env[3] != e_b64 || bs_env[4] != e_neg) {
+        fprintf(stderr, "[tier2-selftest] trace10 mismatch\n");
+        return false;
+    }
+    printf("[tier2-selftest] trace10 bswap/negsetcond OK\n");
+
+    /*
+     * Traces 11-13: inline TLB fast path vs helper slow path, against a
+     * fake env/TLB/RAM built in-test. Layout: env slots at area[32..],
+     * f[0] descriptor at area[30..31] (mask, table), 4-entry table with
+     * guest page 0x1000 -> fake RAM (addr_read/write = 0x1000,
+     * addend = ram - 0x1000). Stub helpers record calls and return
+     * canned values, proving which path executed.
+     */
+    static uint64_t tlb_area[64];
+    static uint64_t tlb_table[16]; /* 4 x 32B entries */
+    static uint8_t tlb_ram[8192];
+    memset(tlb_area, 0, sizeof(tlb_area));
+    memset(tlb_table, 0, sizeof(tlb_table));
+    memset(tlb_ram, 0, sizeof(tlb_ram));
+    tlb_table[4] = 0x1000;                       /* entry[1].addr_read */
+    tlb_table[5] = 0x1000;                       /* entry[1].addr_write */
+    tlb_table[7] = (uint64_t)tlb_ram - 0x1000;   /* entry[1].addend */
+    tlb_area[30] = 0x60;                         /* mask: (4-1)<<5 */
+    tlb_area[31] = (uint64_t)tlb_table;          /* table */
+    /* ram[4..8] = 0xAABBCCDD (LE bytes). */
+    tlb_ram[4] = 0xDD;
+    tlb_ram[5] = 0xCC;
+    tlb_ram[6] = 0xBB;
+    tlb_ram[7] = 0xAA;
+    static void *tlb_fake_env = (void *)&tlb_area[32];
+    Tier2TlbLayout tlb_test;
+    memset(&tlb_test, 0, sizeof(tlb_test));
+    tlb_test.valid = true;
+    tlb_test.f0_off = -16;
+    tlb_test.f_stride = 16;
+    tlb_test.n_modes = 1;
+    tlb_test.entry_bits = 5;
+    tlb_test.e_read = 0;
+    tlb_test.e_write = 8;
+    tlb_test.e_addend = 24;
+    tlb_test.page_bits = 12;
+    tlb_test.page_mask = ~0xFFFULL;
+    auto mkTlbTrace = [&](uint32_t id, uint64_t pc, Tier2TraceDesc &t) {
+        memset(&t, 0, sizeof(t));
+        t.num_tbs = 1;
+        t.has_ops = true;
+        t.guest_mem_allowed = true;
+        t.trace_id = id;
+        t.header_pc = pc;
+        t.rx_header = (const void *)pc;
+        /* mem_helpers left zeroed here; each test fills the slots its
+         * trace can reach (missing helper = compile bail). */
+        t.tlb = tlb_test;
+        for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+            t.next[i] = -1;
+            t.next_slot[i] = -1;
+        }
+        t.header_idx = 0;
+        t.recs[0].pc = pc;
+        t.recs[0].rx_tb = (const void *)pc;
+    };
+    /* Trace 11: TLB-hit 4-byte load. */
+    auto t11 = std::make_unique<Tier2TraceDesc>();
+    mkTlbTrace(11, 0xB000, (*t11));
+        t11->mem_helpers.ld32u = (void *)&tlb_stub_ld32;
+    Tier2TBRec &r11 = t11->recs[0];
+    r11.num_temps = 2;
+    mkTemp(r11, 0, true, false, 64, -1, 0x1004);
+    mkTemp(r11, 1, false, false, 64, -1, 0);
+    r11.num_ops = 3;
+    r11.ops[0] = mkOp(T2_QEMU_LD, 64, 1, 0, -1, -1, -1, 64, 4);
+    r11.ops[1] = mkOp(T2_ST64, 64, -1, 1, -1, -1, -1, 40, 0);
+    r11.ops[2] = mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0xB000, 0);
+    tlb_stub_ld_calls = 0;
+    void *fn11 = tier2_jit_compile_trace(t11.get());
+    if (!fn11) {
+        fprintf(stderr, "[tier2-selftest] trace11 failed to compile\n");
+        return false;
+    }
+    ret = ((FnT)fn11)(tlb_fake_env);
+    /*
+     * Proves the inline fast path: the helper must NOT have run, and
+     * the value came from fake RAM through the TLB walk. Exit is the
+     * protocol encoding for TB 0 / idx 0.
+     */
+    if (ret != (TIER2_EXIT_PROTOCOL | 0) || tlb_stub_ld_calls != 0 ||
+        tlb_area[32 + 5] != 0xAABBCCDDULL) {
+        fprintf(stderr, "[tier2-selftest] trace11 mismatch: ret=0x%llx "
+                "helpercalls=%d val=0x%llx\n",
+                (unsigned long long)ret, tlb_stub_ld_calls,
+                (unsigned long long)tlb_area[32 + 5]);
+        return false;
+    }
+    printf("[tier2-selftest] trace11 TLB-hit load OK\n");
+
+    /*
+     * Trace 12: unmapped address misses the TLB and must take the
+     * helper slow path (stub records the call, returns canned value).
+     */
+    auto t12 = std::make_unique<Tier2TraceDesc>();
+    mkTlbTrace(12, 0xB001, (*t12));
+    t12->mem_helpers.ld32u = (void *)&tlb_stub_ld32;
+    Tier2TBRec &r12 = t12->recs[0];
+    r12.num_temps = 2;
+    mkTemp(r12, 0, true, false, 64, -1, 0x5000);
+    mkTemp(r12, 1, false, false, 64, -1, 0);
+    r12.num_ops = 3;
+    r12.ops[0] = mkOp(T2_QEMU_LD, 64, 1, 0, -1, -1, -1, 64, 4);
+    r12.ops[1] = mkOp(T2_ST64, 64, -1, 1, -1, -1, -1, 40, 0);
+    r12.ops[2] = mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0xB001, 0);
+    tlb_stub_ld_calls = 0;
+    tlb_stub_ld_addr = 0;
+    void *fn12 = tier2_jit_compile_trace(t12.get());
+    if (!fn12) {
+        fprintf(stderr, "[tier2-selftest] trace12 failed to compile\n");
+        return false;
+    }
+    ret = ((FnT)fn12)(tlb_fake_env);
+    if (ret != (TIER2_EXIT_PROTOCOL | 1) || tlb_stub_ld_calls != 1 ||
+        tlb_stub_ld_addr != 0x5000 ||
+        tlb_area[32 + 5] != 0xdeadbeefdeadbeefULL) {
+        fprintf(stderr, "[tier2-selftest] trace12 mismatch: ret=0x%llx "
+                "calls=%d addr=0x%llx val=0x%llx\n",
+                (unsigned long long)ret, tlb_stub_ld_calls,
+                (unsigned long long)tlb_stub_ld_addr,
+                (unsigned long long)tlb_area[32 + 5]);
+        return false;
+    }
+    printf("[tier2-selftest] trace12 TLB-miss slow path OK\n");
+
+    /*
+     * Trace 13: aligned store hits inline (RAM bytes change, no helper
+     * call); unaligned store takes the slow path (stub records it, RAM
+     * untouched by fast path).
+     */
+    auto t13 = std::make_unique<Tier2TraceDesc>();
+    mkTlbTrace(13, 0xB002, (*t13));
+    t13->mem_helpers.st32 = (void *)&tlb_stub_st32;
+    Tier2TBRec &r13 = t13->recs[0];
+    r13.num_temps = 3;
+    mkTemp(r13, 0, true, false, 64, -1, 0x1008);
+    mkTemp(r13, 1, true, false, 64, -1, 0x11223344);
+    mkTemp(r13, 2, true, false, 64, -1, 0x1003);
+    r13.num_ops = 3;
+    r13.ops[0] = mkOp(T2_QEMU_ST, 64, -1, 1, 0, -1, -1, 64, 4);
+    r13.ops[1] = mkOp(T2_QEMU_ST, 64, -1, 1, 2, -1, -1, 64, 4);
+    r13.ops[2] = mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0xB000, 0);
+    tlb_stub_st_calls = 0;
+    tlb_stub_st_addr = 0;
+    tlb_stub_st_val = 0;
+    void *fn13 = tier2_jit_compile_trace(t13.get());
+    if (!fn13) {
+        fprintf(stderr, "[tier2-selftest] trace13 failed to compile\n");
+        return false;
+    }
+    ret = ((FnT)fn13)(tlb_fake_env);
+    bool ram_ok = tlb_ram[8] == 0x44 && tlb_ram[9] == 0x33 &&
+                  tlb_ram[10] == 0x22 && tlb_ram[11] == 0x11;
+    bool ram_untouched = tlb_ram[3] == 0;
+    if (ret != (TIER2_EXIT_PROTOCOL | 0) || !ram_ok || !ram_untouched ||
+        tlb_stub_st_calls != 1 || tlb_stub_st_addr != 0x1003 ||
+        tlb_stub_st_val != 0x11223344u) {
+        fprintf(stderr, "[tier2-selftest] trace13 mismatch: ret=0x%llx "
+                "ram=%02x%02x%02x%02x calls=%d addr=0x%llx val=0x%llx\n",
+                (unsigned long long)ret, tlb_ram[8], tlb_ram[9],
+                tlb_ram[10], tlb_ram[11], tlb_stub_st_calls,
+                (unsigned long long)tlb_stub_st_addr,
+                (unsigned long long)tlb_stub_st_val);
+        return false;
+    }
+    printf("[tier2-selftest] trace13 store hit + unaligned slow path OK\n");
+
+    /*
+     * Trace 14: goto_ptr fed by a lookup call tail-calls the prologue
+     * with the result instead of round-tripping the dispatcher. Fake
+     * prologue returns code+1; expect 0x5001.
+     */
+    g_prologue_fn = (TCGPrologueFn)&stest_prologue;
+    Tier2TraceDesc t14;
+    memset(&t14, 0, sizeof(t14));
+    t14.num_tbs = 1;
+    t14.has_ops = true;
+    t14.trace_id = 14;
+    t14.header_pc = 0xC000;
+    t14.rx_header = (const void *)0xC000;
+    t14.lookup_helper = (const void *)&stest_lookup;
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t14.next[i] = -1;
+        t14.next_slot[i] = -1;
+    }
+    t14.header_idx = 0;
+    Tier2TBRec &r14 = t14.recs[0];
+    r14.pc = 0xC000;
+    r14.rx_tb = (const void *)0xC000;
+    r14.num_temps = 2;
+    mkTemp(r14, 0, false, false, 64, -1, 0);
+    mkTemp(r14, 1, false, true, 64, -1, 0);
+    auto callimm14 = (int64_t)(T2T_PTR | (T2T_PTR << 3) | (1 << 16) | (1 << 20));
+    r14.num_ops = 3;
+    r14.ops[0] = mkOp(T2_CALL, 64, 0, 1, -1, -1, -1,
+                      (int64_t)(uintptr_t)(void *)&stest_lookup, callimm14);
+    r14.ops[1] = mkOp(T2_GOTO_PTR, 0, -1, 0, -1, -1, -1, 0, 0);
+    r14.ops[2] = mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0xC1, 0);
+    void *fn14 = tier2_jit_compile_trace(&t14);
+    if (!fn14) {
+        fprintf(stderr, "[tier2-selftest] trace14 failed to compile\n");
+        return false;
+    }
+    ret = ((FnT)fn14)(dummy_env);
+    if (ret != 0x5001) {
+        fprintf(stderr, "[tier2-selftest] trace14 mismatch: ret=0x%llx\n",
+                (unsigned long long)ret);
+        return false;
+    }
+    printf("[tier2-selftest] trace14 prologue tail-call OK\n");
+
+    /*
+     * Trace 15: on-disk cache round-trip. Compile (miss + store),
+     * tear down the JIT entirely, rebuild it empty, compile the identical
+     * descriptor again: the second compile must take the file path
+     * (cache_hits +1) and the loaded object must execute bit-identically.
+     * This exercises emit -> write -> read -> link -> run, not just the
+     * live-JIT dedup path.
+     */
+    Tier2TraceDesc t15;
+    memset(&t15, 0, sizeof(t15));
+    t15.num_tbs = 1;
+    t15.has_ops = true;
+    t15.trace_id = 15;
+    t15.header_pc = 0xD000;
+    t15.rx_header = (const void *)0xD000;
+    snprintf(t15.guest_arch, sizeof(t15.guest_arch), "%s", "selftest");
+    snprintf(t15.qemu_version, sizeof(t15.qemu_version), "%s", "selftest");
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t15.next[i] = -1;
+        t15.next_slot[i] = -1;
+    }
+    t15.header_idx = 0;
+    Tier2TBRec &r15 = t15.recs[0];
+    r15.pc = 0xD000;
+    r15.rx_tb = (const void *)0xD000;
+    r15.num_temps = 5;
+    mkTemp(r15, 0, true, false, 64, -1, 0);
+    mkTemp(r15, 1, true, false, 64, -1, 1);
+    mkTemp(r15, 2, false, false, 64, -1, 0);
+    mkTemp(r15, 3, false, false, 64, -1, 0);
+    mkTemp(r15, 4, true, false, 64, -1, 100);
+    std::vector<Tier2OpRec> o15;
+    o15.push_back(mkOp(T2_LD64, 64, 2, -1, -1, -1, -1, 0, 0));
+    o15.push_back(mkOp(T2_MOV, 64, 3, 0, -1, -1, -1, 0, 0));
+    o15.push_back(mkOp(T2_SETLABEL, 0, -1, -1, -1, -1, -1, 1, 0));
+    o15.push_back(mkOp(T2_ADD, 64, 2, 2, 3, -1, -1, 0, 0));
+    o15.push_back(mkOp(T2_ADD, 64, 3, 3, 1, -1, -1, 0, 0));
+    o15.push_back(mkOp(T2_BRCOND, 64, -1, 3, 4, -1, -1, T2C_LTU, 1));
+    o15.push_back(mkOp(T2_ST64, 64, -1, 2, -1, -1, -1, 0, 0));
+    o15.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0xD000, 0));
+    r15.num_ops = (uint32_t)o15.size();
+    for (size_t i = 0; i < o15.size(); i++) {
+        r15.ops[i] = o15[i];
+    }
+    static uint64_t cch_env[4];
+    memset(cch_env, 0, sizeof(cch_env));
+    cch_env[0] = 5;
+    /* Reference: acc = 5 + sum(0..99). */
+    uint64_t cch_ref = 5;
+    for (uint64_t k = 0; k < 100; k++) {
+        cch_ref += k;
+    }
+    uint64_t hits0 = tier2_jit_cache_hits();
+    void *fn15a = tier2_jit_compile_trace(&t15);
+    if (!fn15a) {
+        fprintf(stderr, "[tier2-selftest] trace15 failed to compile\n");
+        return false;
+    }
+    if (((FnT)fn15a)(cch_env) != (TIER2_EXIT_PROTOCOL | 0) ||
+        cch_env[0] != cch_ref) {
+        fprintf(stderr, "[tier2-selftest] trace15 fresh mismatch\n");
+        return false;
+    }
+    /* Drop the entire JIT (empty registry, live-lookup impossible). */
+    tier2_jit_shutdown();
+    {
+        auto JITExp = LLJITBuilder().create();
+        if (!JITExp) {
+            return false;
+        }
+        g_jit = std::move(*JITExp);
+        g_initialized.store(true);
+    }
+    void *fn15b = tier2_jit_compile_trace(&t15);
+    if (!fn15b) {
+        fprintf(stderr, "[tier2-selftest] trace15 reload failed\n");
+        return false;
+    }
+    if (tier2_jit_cache_hits() != hits0 + 1) {
+        fprintf(stderr, "[tier2-selftest] trace15: expected a cache hit\n");
+        return false;
+    }
+    memset(cch_env, 0, sizeof(cch_env));
+    cch_env[0] = 5;
+    if (((FnT)fn15b)(cch_env) != (TIER2_EXIT_PROTOCOL | 0) ||
+        cch_env[0] != cch_ref) {
+        fprintf(stderr, "[tier2-selftest] trace15 cached mismatch\n");
+        return false;
+    }
+    printf("[tier2-selftest] trace15 on-disk cache round-trip OK\n");
+
+    /*
+     * Trace 16: P5 self back-edge fuses into a native loop. Single TB
+     * with a proven self-edge (next[0]==0, slot 1): the body decrements
+     * an env counter, BRCOND exits when it hits zero, and GOTO_TB slot
+     * 1 loops. The old behavior returned after ONE iteration per
+     * dispatch (side-exit origin k=0 idx=1); the fused loop runs to
+     * completion in one dispatch (done-exit idx=0). A preset interrupt
+     * word must divert the first back-edge to the safepoint exit
+     * instead, leaving exactly one committed iteration behind.
+     */
+    struct FakeCPU16 {
+        uint32_t irq;
+        uint8_t pad[12];
+        uint64_t env[4];
+    };
+    static FakeCPU16 fake16;
+    auto t16 = std::make_unique<Tier2TraceDesc>();
+    memset(t16.get(), 0, sizeof(*t16));
+    t16->num_tbs = 1;
+    t16->has_ops = true;
+    t16->trace_id = 16;
+    t16->header_pc = 0xE000;
+    t16->rx_header = (const void *)0xE000;
+    t16->has_safepoint = true;
+    t16->cpu_off = (int64_t)(uintptr_t)&fake16 -
+                   (int64_t)(uintptr_t)&fake16.env[0];
+    t16->irq_off = (int64_t)offsetof(FakeCPU16, irq);
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t16->next[i] = -1;
+        t16->next_slot[i] = -1;
+    }
+    t16->next[0] = 0;
+    t16->next_slot[0] = 1;
+    t16->header_idx = 0;
+    Tier2TBRec &r16 = t16->recs[0];
+    r16.pc = 0xE000;
+    r16.size = 16;
+    r16.rx_tb = (const void *)0xE000;
+    r16.num_temps = 4;
+    mkTemp(r16, 0, true, false, 64, -1, 0);
+    mkTemp(r16, 1, true, false, 64, -1, 1);
+    mkTemp(r16, 2, false, false, 64, -1, 0);
+    mkTemp(r16, 3, false, false, 64, -1, 0);
+    std::vector<Tier2OpRec> o16;
+    o16.push_back(mkOp(T2_LD64, 64, 2, -1, -1, -1, -1, 0, 0));
+    o16.push_back(mkOp(T2_LD64, 64, 3, -1, -1, -1, -1, 8, 0));
+    o16.push_back(mkOp(T2_ADD, 64, 3, 3, 2, -1, -1, 0, 0));
+    o16.push_back(mkOp(T2_SUB, 64, 2, 2, 1, -1, -1, 0, 0));
+    o16.push_back(mkOp(T2_ST64, 64, -1, 3, -1, -1, -1, 8, 0));
+    o16.push_back(mkOp(T2_ST64, 64, -1, 2, -1, -1, -1, 0, 0));
+    o16.push_back(mkOp(T2_BRCOND, 64, -1, 2, 0, -1, -1, T2C_EQ, 2));
+    o16.push_back(mkOp(T2_GOTO_TB, 0, -1, -1, -1, -1, -1, 1, 0));
+    o16.push_back(mkOp(T2_SETLABEL, 0, -1, -1, -1, -1, -1, 2, 0));
+    o16.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0xE000, 0));
+    r16.num_ops = (uint32_t)o16.size();
+    for (size_t i = 0; i < o16.size(); i++) {
+        r16.ops[i] = o16[i];
+    }
+    void *fn16 = tier2_jit_compile_trace(t16.get());
+    if (!fn16) {
+        fprintf(stderr, "[tier2-selftest] trace16 failed to compile\n");
+        return false;
+    }
+    fake16.irq = 0;
+    fake16.env[0] = 1000;
+    fake16.env[1] = 0;
+    if (((FnT)fn16)(&fake16.env[0]) != (TIER2_EXIT_PROTOCOL | 0) ||
+        fake16.env[0] != 0 || fake16.env[1] != 500500) {
+        fprintf(stderr, "[tier2-selftest] trace16 loop mismatch: "
+                "counter=%llu acc=%llu\n",
+                (unsigned long long)fake16.env[0],
+                (unsigned long long)fake16.env[1]);
+        return false;
+    }
+    printf("[tier2-selftest] trace16 native self-loop OK\n");
+    /* Safepoint: preset interrupt diverts the first back-edge. */
+    fake16.irq = 1;
+    fake16.env[0] = 1000;
+    fake16.env[1] = 0;
+    if (((FnT)fn16)(&fake16.env[0]) != (TIER2_EXIT_PROTOCOL | 1) ||
+        fake16.env[0] != 999 || fake16.env[1] != 1000) {
+        fprintf(stderr, "[tier2-selftest] trace16 safepoint mismatch: "
+                "counter=%llu acc=%llu\n",
+                (unsigned long long)fake16.env[0],
+                (unsigned long long)fake16.env[1]);
+        return false;
+    }
+    /* Cleared interrupt resumes to completion. */
+    fake16.irq = 0;
+    if (((FnT)fn16)(&fake16.env[0]) != (TIER2_EXIT_PROTOCOL | 0) ||
+        fake16.env[0] != 0 || fake16.env[1] != 500500) {
+        fprintf(stderr, "[tier2-selftest] trace16 resume mismatch: "
+                "counter=%llu acc=%llu\n",
+                (unsigned long long)fake16.env[0],
+                (unsigned long long)fake16.env[1]);
+        return false;
+    }
+    printf("[tier2-selftest] trace16 safepoint poll OK\n");
 
     printf("[tier2-selftest] ALL GREEN\n");
     return true;
@@ -1348,6 +3561,16 @@ extern "C" bool tier2_jit_bench(void)
         }
         g_jit = std::move(*JITExp);
         g_initialized.store(true);
+    }
+
+    /*
+     * Fresh temp cache dir per run: this benchmark times compilation,
+     * so it must neither hit entries from previous runs nor pollute
+     * the user's cache.
+     */
+    char tmpl[] = "/tmp/tier2-bench-XXXXXX";
+    if (mkdtemp(tmpl)) {
+        setenv("QEMU_TIER2_CACHE_DIR", tmpl, 1);
     }
 
     static const uint64_t N = 8000000;

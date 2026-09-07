@@ -428,6 +428,19 @@ static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
  * TCG is not considered a security-sensitive part of QEMU so this does not
  * affect the impact of CFI in environment with high security requirements
  */
+/*
+ * Exact-state TB lookup for the tier-2 async sampler (P6). Pure hash
+ * lookup, no codegen on miss (returns NULL). Caller must hold
+ * rcu_read_lock(); TB structs are RCU-stable under it.
+ */
+TranslationBlock *tier2_tb_lookup(CPUState *cpu, vaddr pc, uint64_t cs_base,
+                                  uint32_t flags, uint32_t cflags)
+{
+    TCGTBCPUState s = {
+        .pc = pc, .flags = flags, .cflags = cflags, .cs_base = cs_base,
+    };
+    return tb_htable_lookup(cpu, s);
+}
 static inline TranslationBlock * QEMU_DISABLE_CFI
 cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 {
@@ -436,6 +449,15 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     const void *tb_ptr = itb->tc.ptr;
 
     tier2_profile_sample(cpu, itb);
+
+    /*
+     * P6 async profiler: one predictable branch when the table is empty;
+     * range-match + force-compile when the sampler flagged a hotspot
+     * (notably chained steady-state loops the inline sampler can't see).
+     */
+    if (unlikely(tier2_has_prof_requests)) {
+        tier2_check_prof_requests(cpu, itb);
+    }
 
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
@@ -452,12 +474,46 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     if (unlikely(tier2_fn != NULL) && !(tb_cflags(itb) & CF_INVALID) &&
         likely(QTAILQ_EMPTY(&cpu->breakpoints))) {
         typedef uintptr_t (*Tier2Func)(CPUArchState *env);
+        if (unlikely(tier2_counting)) {
+            tier2_note_dispatch(true);
+        }
         ret = ((Tier2Func)tier2_fn)(cpu_env(cpu));
     } else {
+        if (unlikely(tier2_counting)) {
+            tier2_note_dispatch(false);
+        }
         ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
     }
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
+    if (unlikely((int64_t)ret < 0)) {
+        /*
+         * Tier-2 side-exit protocol (see tcg/llvm/tier2.h): compiled code
+         * returns small (tb-index, exit-idx) codes instead of baked TB
+         * pointers, so cached native objects stay relocatable. Resolve
+         * against the installed record's CURRENT rx values; on any doubt
+         * (no record, stale generation, bad index) fall back to a clean
+         * dispatcher lookup, exactly like a goto_ptr miss.
+         */
+        unsigned idx = ret & TB_EXIT_MASK;
+        unsigned k = (ret >> TIER2_EXIT_TB_SHIFT) & 0xF;
+        if (unlikely(idx == 2)) {
+            idx = 0; /* unreachable by construction; stay well-formed */
+        }
+        Tier2Installed *rec = qatomic_rcu_read(&itb->tier2_rec);
+        if (rec != NULL && k < rec->num_members &&
+            rec->gen == tier2_snap_gen_current()) {
+            void *rx = rec->rx[k];
+            if (rx != NULL) {
+                last_tb = tcg_splitwx_to_rw(rx);
+                *tb_exit = idx;
+                goto tier2_exit_done;
+            }
+        }
+        last_tb = NULL;
+        *tb_exit = idx;
+        goto tier2_exit_done;
+    }
     /*
      * TODO: Delay swapping back to the read-write region of the TB
      * until we actually need to modify the TB.  The read-only copy,
@@ -469,6 +525,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     last_tb = tcg_splitwx_to_rw((void *)(ret & ~TB_EXIT_MASK));
     *tb_exit = ret & TB_EXIT_MASK;
 
+tier2_exit_done:
     trace_exec_tb_exit(last_tb, *tb_exit);
 
     if (*tb_exit > TB_EXIT_IDX1) {

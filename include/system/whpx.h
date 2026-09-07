@@ -33,4 +33,6 @@ extern bool whpx_irqchip_in_kernel;
 #define whpx_irqchip_in_kernel() (0)
 #endif /* !CONFIG_WHPX_IS_POSSIBLE */
 
+void whpx_update_guest_pa_range(uint64_t start_pa, uint64_t size, void *host_va, int readonly, int add);
+
 #endif /* QEMU_WHPX_H */

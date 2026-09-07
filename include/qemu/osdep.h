@@ -888,6 +888,13 @@ static inline int platform_does_not_support_system(const char *command)
 }
 #endif /* !HAVE_SYSTEM_FUNCTION */
 
+/**
+ * Automatically pin process/threads to performance (big/prime) cores
+ * on heterogeneous multi-core hosts (e.g. ARM big.LITTLE on Android/Linux)
+ * or set interactive QoS priority on Apple Silicon (Darwin).
+ */
+void os_setup_cpu_affinity(void);
+
 #ifdef __cplusplus
 }
 #endif

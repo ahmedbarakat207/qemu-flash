@@ -13,6 +13,8 @@
 #include "qemu/accel.h"
 #include "accel/accel-ops.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
+#include "exec/cpu-common.h"
 #include "system/whpx.h"
 #include "system/cpus.h"
 #include "system/runstate.h"
@@ -330,6 +332,41 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
         error_report("WHPX: failed to map GPA range");
         abort();
     }
+}
+
+void whpx_update_guest_pa_range(uint64_t start_pa, uint64_t size, void *host_va, int readonly, int add)
+{
+    MemoryRegion mr;
+    MemoryRegionSection section;
+    RAMBlock ram_block;
+
+    memset(&ram_block, 0, sizeof(RAMBlock));
+    ram_block.mr = &mr;
+    ram_block.used_length = REAL_HOST_PAGE_ALIGN(size);
+    ram_block.max_length = REAL_HOST_PAGE_ALIGN(size);
+    ram_block.fd = -1;
+    ram_block.guest_memfd = -1;
+    ram_block.page_size = qemu_real_host_page_size();
+    ram_block.host = host_va;
+    ram_block.flags |= RAM_PREALLOC;
+
+    memory_region_init(&mr, NULL, NULL, REAL_HOST_PAGE_ALIGN(size));
+    mr.ram = true;
+    mr.ram_block = &ram_block;
+    mr.readonly = readonly;
+    mr.nonvolatile = false;
+
+    memset(&section, 0, sizeof(section));
+    section.mr = &mr;
+    section.fv = NULL;
+    section.offset_within_region = 0;
+    section.size = mr.size;
+    section.offset_within_address_space = start_pa;
+    section.readonly = mr.readonly;
+    section.nonvolatile = mr.nonvolatile;
+
+    whpx_set_phys_mem(&section, add);
+    object_unref(OBJECT(&mr));
 }
 
 static void whpx_region_add(MemoryListener *listener,

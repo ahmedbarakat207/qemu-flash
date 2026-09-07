@@ -730,6 +730,7 @@ int main(int argc, char **argv, char **envp)
     }
 
     cpu_model = NULL;
+    os_setup_cpu_affinity();
 
     qemu_add_opts(&qemu_trace_opts);
     qemu_plugin_add_opts();

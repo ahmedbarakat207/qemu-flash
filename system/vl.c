@@ -875,6 +875,13 @@ static MachineClass *find_default_machine(GSList *machines)
     return default_machineclass;
 }
 
+static void feature(void)
+{
+    /* ALIGNED() helper is gone in 11.x; plain empty tag keeps behavior. */
+    static const char rev_[1] = "";
+    printf("  featuring qemu-3dfx@%s"__TIME__" "__DATE__" build\n", rev_);
+}
+
 static void version(void)
 {
     printf("QEMU emulator version " QEMU_FULL_VERSION "\n"
@@ -2898,6 +2905,7 @@ void qemu_init(int argc, char **argv)
     qemu_init_exec_dir(argv[0]);
 
     os_setup_limits();
+    os_setup_cpu_affinity();
 
     module_call_init(MODULE_INIT_TARGET_INFO);
     target_info_qom_set_target();
@@ -3113,6 +3121,7 @@ void qemu_init(int argc, char **argv)
                 break;
             case QEMU_OPTION_version:
                 version();
+                feature();
                 exit(0);
                 break;
             case QEMU_OPTION_m:

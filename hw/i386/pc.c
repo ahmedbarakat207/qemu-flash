@@ -1138,12 +1138,33 @@ void pc_basic_device_init(struct PCMachineState *pcms,
             ? ON_OFF_AUTO_OFF : ON_OFF_AUTO_ON;
     }
 
+    /* Glide pass-through */
+    glidept_mm_init();
+    /* MESA pass-through */
+    mesapt_mm_init();
     /* Super I/O */
     pc_superio_init(isa_bus, create_fdctrl, pcms->i8042_enabled,
                     pcms->vmport != ON_OFF_AUTO_ON, &error_fatal);
 
     pcms->machine_done.notify = pc_machine_done;
     qemu_add_machine_init_done_notifier(&pcms->machine_done);
+}
+
+void glidept_mm_init(void)
+{
+    DeviceState *glidept_dev = NULL;
+
+    glidept_dev = qdev_new(TYPE_GLIDEPT);
+    sysbus_realize(SYS_BUS_DEVICE(glidept_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(glidept_dev), 0, GLIDEPT_MM_BASE);
+}
+void mesapt_mm_init(void)
+{
+    DeviceState *mesapt_dev = NULL;
+
+    mesapt_dev = qdev_new(TYPE_MESAPT);
+    sysbus_realize(SYS_BUS_DEVICE(mesapt_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(mesapt_dev), 0, MESAPT_MM_BASE);
 }
 
 void pc_nic_init(PCMachineClass *pcmc, ISABus *isa_bus, PCIBus *pci_bus)

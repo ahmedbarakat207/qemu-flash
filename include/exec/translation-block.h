@@ -152,6 +152,15 @@ struct TranslationBlock {
     uint32_t exec_count;
     bool tier2_enqueued;
     void *tier2_code;
+    /*
+     * RCU-installed trace record for tier-2 side exits (exit protocol):
+     * lets compiled code return small (tb-index, exit-idx) codes that
+     * cpu_tb_exec resolves against CURRENT TB addresses, so cached
+     * native objects never bake ASLR-unstable or lifetime-unstable
+     * pointers. Published/retired under RCU; use qatomic_rcu_read/set.
+     * Forward-declared (full type in tcg/llvm/tier2.h).
+     */
+    struct Tier2Installed *tier2_rec;
 };
 
 /* The alignment given to TranslationBlock during allocation. */

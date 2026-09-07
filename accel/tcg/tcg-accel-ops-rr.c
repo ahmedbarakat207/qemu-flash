@@ -34,6 +34,7 @@
 #include "exec/cpu-common.h"
 #include "accel/tcg/cpu-loop.h"
 #include "tcg/startup.h"
+#include "tcg/llvm/tier2.h"
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
@@ -195,6 +196,8 @@ static void *rr_cpu_thread_fn(void *arg)
     cpu->thread_id = qemu_get_thread_id();
     cpu->neg.can_do_io = true;
     cpu_thread_signal_created(cpu);
+    /* P6 async profiler: let the sampler's SIGPROF reach this thread. */
+    tier2_unblock_profiler_signal();
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
     /* wait for initial kick-off after machine start */

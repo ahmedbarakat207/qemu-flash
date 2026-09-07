@@ -34,6 +34,7 @@
 #include "hw/core/boards.h"
 #include "accel/tcg/cpu-loop.h"
 #include "tcg/startup.h"
+#include "tcg/llvm/tier2.h"
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-mttcg.h"
 
@@ -84,6 +85,8 @@ static void *mttcg_cpu_thread_fn(void *arg)
     cpu->neg.can_do_io = true;
     current_cpu = cpu;
     cpu_thread_signal_created(cpu);
+    /* P6 async profiler: let the sampler's SIGPROF reach this thread. */
+    tier2_unblock_profiler_signal();
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
     do {

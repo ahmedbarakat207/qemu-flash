@@ -1033,3 +1033,130 @@ int qemu_shm_alloc(size_t size, Error **errp)
 
     return fd;
 }
+
+#if defined(__linux__)
+#include <sched.h>
+#elif defined(CONFIG_DARWIN)
+#include <pthread/qos.h>
+#endif
+
+void os_setup_cpu_affinity(void)
+{
+    const char *env = getenv("QEMU_PIN_CORES");
+    if (env && (strcmp(env, "off") == 0 || strcmp(env, "0") == 0 ||
+                strcmp(env, "none") == 0 || strcmp(env, "false") == 0)) {
+        return;
+    }
+
+#if defined(__linux__)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+
+    if (env && strcmp(env, "auto") != 0) {
+        /* Parse user-specified range/list: e.g. "4-7" or "4,5,6,7" or "4" */
+        char *copy = g_strdup(env);
+        char *token, *saveptr;
+        for (token = strtok_r(copy, ",", &saveptr); token;
+             token = strtok_r(NULL, ",", &saveptr)) {
+            int start, end;
+            if (sscanf(token, "%d-%d", &start, &end) == 2) {
+                for (int c = start; c <= end; c++) {
+                    if (c >= 0 && c < CPU_SETSIZE) {
+                        CPU_SET(c, &cpuset);
+                    }
+                }
+            } else if (sscanf(token, "%d", &start) == 1) {
+                if (start >= 0 && start < CPU_SETSIZE) {
+                    CPU_SET(start, &cpuset);
+                }
+            }
+        }
+        g_free(copy);
+        if (CPU_COUNT(&cpuset) > 0) {
+            if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+                info_report("pinned to CPU cores (via QEMU_PIN_CORES): %s", env);
+            }
+            return;
+        }
+    }
+
+    /* Auto-detect heterogeneous CPU topology (e.g. ARM big.LITTLE / DynamIQ on Android/Linux) */
+    long num_cpus = sysconf(_SC_NPROCESSORS_CONF);
+    if (num_cpus <= 1) {
+        return;
+    }
+    if (num_cpus > 1024) {
+        num_cpus = 1024;
+    }
+
+    unsigned long *scores = g_new0(unsigned long, num_cpus);
+    unsigned long max_score = 0;
+    unsigned long min_score = (unsigned long)-1;
+    int valid_scores = 0;
+
+    for (int i = 0; i < num_cpus; i++) {
+        char path[128];
+        FILE *f = NULL;
+        unsigned long val = 0;
+
+        /* 1. Try cpuinfo_max_freq (kHz) */
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+        f = fopen(path, "r");
+        if (!f) {
+            /* 2. Fallback: scaling_max_freq (kHz) */
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", i);
+            f = fopen(path, "r");
+        }
+        if (!f) {
+            /* 3. Fallback: cpu_capacity (EAS capacity: 0-1024) */
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/cpu_capacity", i);
+            f = fopen(path, "r");
+        }
+
+        if (f) {
+            if (fscanf(f, "%lu", &val) == 1 && val > 0) {
+                scores[i] = val;
+                if (val > max_score) {
+                    max_score = val;
+                }
+                if (val < min_score) {
+                    min_score = val;
+                }
+                valid_scores++;
+            }
+            fclose(f);
+        }
+    }
+
+    /* Heterogeneous system: select big/prime cores (exclude little cores) */
+    if (valid_scores > 1 && max_score > min_score) {
+        unsigned long threshold = min_score + (max_score - min_score) * 4 / 10;
+        GString *core_str = g_string_new("");
+        int first = 1;
+        for (int i = 0; i < num_cpus; i++) {
+            if (scores[i] >= threshold && i < CPU_SETSIZE) {
+                CPU_SET(i, &cpuset);
+                if (!first) {
+                    g_string_append_c(core_str, ',');
+                }
+                g_string_append_printf(core_str, "%d", i);
+                first = 0;
+            }
+        }
+        if (CPU_COUNT(&cpuset) > 0) {
+            if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+                info_report("auto-pinned to performance CPU cores: %s", core_str->str);
+            }
+        }
+        g_string_free(core_str, true);
+    }
+    g_free(scores);
+
+#elif defined(CONFIG_DARWIN)
+    /* Apple Silicon: prioritize Performance (P) cores over Efficiency (E) cores */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}

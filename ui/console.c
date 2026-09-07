@@ -143,6 +143,11 @@ static void gui_setup_refresh(DisplayState *ds)
     }
 }
 
+void graphic_hw_passthrough(QemuConsole *con, bool passthrough)
+{
+    con->ui_info.passthrough = passthrough;
+}
+
 void qemu_console_hw_update_done(QemuConsole *con)
 {
     if (con) {
@@ -153,6 +158,15 @@ void qemu_console_hw_update_done(QemuConsole *con)
 void qemu_console_hw_update(QemuConsole *con)
 {
     if (!con) {
+        return;
+    }
+    if (con->ui_info.passthrough) {
+        /*
+         * 3Dfx/MESA pass-through renders straight into the host window;
+         * stand down the 2D update path but still complete the update so
+         * coroutines waiting in dump_queue are released.
+         */
+        qemu_console_hw_update_done(con);
         return;
     }
     if (!con->hw_ops->gfx_update || con->hw_ops->gfx_update(con->hw)) {

@@ -489,6 +489,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
     tb->exec_count = 0;
     tb->tier2_enqueued = false;
     tb->tier2_code = NULL;
+    tb->tier2_rec = NULL;
 
     /* init original jump addresses which have been set during tcg_gen_code() */
     if (tb->jmp_reset_offset[0] != TB_JMP_OFFSET_INVALID) {

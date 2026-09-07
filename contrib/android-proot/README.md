@@ -47,3 +47,11 @@ For dynamic apps point at an x86_64 sysroot: `build/qemu-x86_64 -L /x86root ./ap
 - proot adds ptrace overhead per host syscall; steady-state JIT code is
   unaffected. If possible, run `qemu-x86_64` directly in Termux instead
   of inside proot.
+- **Automatic Big-Core Pinning (Built-in)**: The QEMU binary automatically
+  detects heterogeneous CPU clusters via sysfs (`cpuinfo_max_freq` and
+  `cpu_capacity`) at startup and pins itself to the big/prime cores via
+  `sched_setaffinity()`. All vCPU and worker threads inherit this affinity.
+  Override with `QEMU_PIN_CORES=4-7` or disable with `QEMU_PIN_CORES=off`.
+- The launcher defaults to `quiet loglevel=3` and `-nic none` because every
+  serial `write()` and socket syscall triggers a `ptrace` context switch
+  through PRoot. Pass `-net` only when network access is required.
