@@ -37,7 +37,7 @@ void sdl2_2d_update(DisplayChangeListener *dcl,
     size_t surface_data_offset;
     assert(!scon->opengl);
 
-    if (!scon->texture) {
+    if (!scon->texture || w <= 0 || h <= 0) {
         return;
     }
 

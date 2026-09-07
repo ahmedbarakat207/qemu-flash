@@ -129,10 +129,17 @@ void sdl2_window_create(struct sdl2_console *scon)
 #endif
     } else {
         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
+#ifdef __APPLE__
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+#endif
+        SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
         SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1,
                                                  SDL_RENDERER_ACCELERATED);
         if (!scon->real_renderer) {
+#ifdef __APPLE__
+            SDL_ResetHint(SDL_HINT_RENDER_DRIVER);
+#endif
             scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
         }
     }
