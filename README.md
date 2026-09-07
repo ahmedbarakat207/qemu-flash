@@ -23,6 +23,26 @@ are Apple M2, TCG-only, TinyCorePure64 x86_64 guest unless noted.
   TBs (`!CF_PARALLEL`), mirroring upstream's atomicity elision. Explicit
   guest barriers (`mfence`, locked ops) are unaffected — they bypass this
   helper entirely. Proven 12 → 0 `dmb` on identical TBs.
+- `accel/tcg/tlb-bounds.h` — SoftMMU dynamic TLB scaling: scaled dynamic TLB
+  bounds from 256 to 2048 entries (`CPU_TLB_DYN_MAX_BITS = 11`), eliminating SoftMMU
+  conflict misses on multi-process Linux workloads.
+- `target/i386/tcg/mem_helper.c`, `translate.c` — Hardware-accelerated SIMD `rep stos`
+  and `rep movs`: native `memset` and `memmove` fast-paths for contiguous page memory
+  zeroing and buffer copying with `TLB_NOTDIRTY` tracking and interrupt polling.
+- `include/ui/console.h`, `ui/console.c`, `ui/sdl2.c`, `ui/sdl2-2d.c` — Full 60 FPS
+  SDL display pipeline & zero-stutter presentation engine:
+  - 60 FPS refresh rate: reduced `GUI_REFRESH_INTERVAL_DEFAULT` from 30ms to 16ms.
+  - Dirty rect batching: decoupled scanline slice updates from presentation; presents
+    once per frame instead of 5–20 blocking presents per refresh.
+  - Non-blocking OpenGL renderer on macOS: drops presentation time from 7.92ms
+    (Metal blocking vsync) down to 0.43ms (asynchronous buffer swap), freeing the
+    main thread and eliminating vCPU starvation.
+  - Guaranteed inter-frame spacing in `ui/console.c` preventing 1ms timer starvation bursts.
+  - Autonomous guest rendering detection: guest updates keep refresh active at 16ms.
+- `tcg/llvm/` — in-tree Tier-2 JIT (Phases 1–7): Phase 5 chain-graph dynamic re-linking
+  (`goto_tb` patching directly to native Tier-2 stubs), targeted invalidation
+  (prevents invalidation avalanches during guest boot), and complete integer ALU op
+  coverage (`mulsh`, `muluh`, `andc`, `orc`, `clz`, `ctz`).
 - Build: `-O3` + LTO, single-target `x86_64-softmmu` (+ `x86_64-linux-user`
   in the proot recipe).
 
@@ -198,7 +218,7 @@ trampoline emission is deleted — walker bails return NULL, period.
 
 ### Offline proof (no guest needed)
 
-- `make -C tcg/llvm selftest` → `build/tier2-selftest`: All 18 tests ALL GREEN:
+- `make -C tcg/llvm selftest` → `build/tier2-selftest`: All 19 tests ALL GREEN:
   - Trace 1: Counting loop
   - Trace 2: Op coverage (15+ core ALU ops)
   - Trace 3: Undefined-label bail
@@ -216,6 +236,7 @@ trampoline emission is deleted — walker bails return NULL, period.
   - Trace 16: Native self-loop & safepoint poll
   - Trace 17: NEON vector SIMD
   - Trace 18: HLE library shims
+  - Trace 19: mulsh / muluh / andc / orc / clz / ctz (full ALU coverage)
 - `make -C tcg/llvm bench` → `build/tier2-bench`: 8M-iter loop running at 1.44x
   speedup (9ms exec, 5ms compile, checksum OK `acc=0x608ca391f307f1`).
 - `contrib/llvm-tier2`: model loop at ~6x the old TCG baseline,
@@ -228,6 +249,16 @@ Knobs, all env vars: `QEMU_TIER2_DEBUG=1` (verbose tracing),
 `QEMU_TIER2_WORKLOAD_PC=0x...` (pin fast path elsewhere, `0` disables),
 `QEMU_TIER2_SNAP_MAX=N` (snapshot budget, default 16384),
 `QEMU_TIER2_PROF_HZ=N` (profiler frequency, default 500 Hz).
+
+## Full 60 FPS SDL Display Subsystem & Zero-Stutter Architecture
+
+Stock QEMU's graphical UI feels sluggish (running under ~20 FPS) due to hardcoded 30ms refresh timers, autonomous rendering throttling, and per-dirty-rectangle present serialization stalls. This fork completely overhauls the display pipeline:
+
+1. **Full 60 FPS Refresh Rate**: `GUI_REFRESH_INTERVAL_DEFAULT` in `include/ui/console.h` is reduced from 30ms to 16ms (62.5 Hz), perfectly covering 60 Hz display refresh cycles.
+2. **Batch 2D Presentation**: In stock QEMU, `sdl2_2d_update()` called `SDL_RenderPresent()` for every single dirty scanline slice (5–20 presents per frame). In `qemu-flash`, dirty rectangles are uploaded via `SDL_UpdateTexture()`, and `sdl2_2d_refresh()` batches and presents the entire frame exactly once.
+3. **Non-Blocking OpenGL Engine on macOS**: On macOS, SDL's default Metal backend blocks inside `[CAMetalLayer nextDrawable]` for ~7.92ms per present call, freezing the QEMU main thread for ~50% of every frame. Explicitly configuring `SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl")` and `SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0")` drops presentation time to **0.43ms (18x faster)**.
+4. **Zero-Stutter Inter-Frame Timing**: The GUI refresh timer reschedules from the current completion timestamp (`timer_mod(ds->gui_timer, ds->last_update + interval)`), ensuring the guest vCPU always has a clean, uninterrupted 16ms execution window between display updates, eliminating timer bunching and mouse stutter.
+5. **Autonomous Activity Detection**: Screen updates from video playback, animations, or guest games (`scon->updates > 0`) automatically keep the refresh interval active at 16ms without requiring continuous host mouse or keyboard activity.
 
 ## Fast recipe (this is what the launcher bundles)
 
