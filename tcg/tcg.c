@@ -58,6 +58,7 @@
 #include "tcg-internal.h"
 #include "tcg/perf.h"
 #include "tcg-has.h"
+#include "tcg/llvm/tier2.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/guest-base.h"
 #endif
@@ -6644,6 +6645,16 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
             fprintf(logfile, "\n");
             qemu_log_unlock(logfile);
         }
+    }
+
+    /*
+     * Tier-2 snapshot: copy the final optimized op stream into stable
+     * records for the background LLVM compiler thread. The live op list
+     * dies with this translation, so this is the only place capture can
+     * happen. Bounded and cheap; bails internally when disabled/full.
+     */
+    if (tier2_capture_enabled()) {
+        tier2_capture_tb_ops(s, tb);
     }
 
     /* Initialize goto_tb jump offsets. */

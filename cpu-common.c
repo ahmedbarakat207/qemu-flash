@@ -24,6 +24,12 @@
 #include "qemu/lockable.h"
 #include "trace/trace-root.h"
 
+#ifdef CONFIG_TCG
+/* LLVM tier-2: declared here instead of including tcg/llvm/tier2.h, whose
+ * tcg.h dependency needs target context unavailable to generic code. */
+void tier2_invalidate_all(void);
+#endif
+
 QemuMutex qemu_cpu_list_lock;
 static QemuCond exclusive_cond;
 static QemuCond exclusive_resume;
@@ -429,6 +435,15 @@ int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
         *breakpoint = bp;
     }
 
+#ifdef CONFIG_TCG
+    /*
+     * Tier-2 compiled code bypasses QEMU's breakpoint-page checks at
+     * dispatch, so any breakpoint change forces all traces back to TCG.
+     * Retire-only (no ORC release): vCPUs may be running here.
+     */
+    tier2_invalidate_all();
+#endif
+
     trace_breakpoint_insert(cpu->cpu_index, pc, flags);
     return 0;
 }
@@ -455,6 +470,11 @@ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
 void cpu_breakpoint_remove_by_ref(CPUState *cpu, CPUBreakpoint *bp)
 {
     QTAILQ_REMOVE(&cpu->breakpoints, bp, entry);
+
+#ifdef CONFIG_TCG
+    /* See cpu_breakpoint_insert: breakpoint changes retire tier-2 code. */
+    tier2_invalidate_all();
+#endif
 
     trace_breakpoint_remove(cpu->cpu_index, bp->pc, bp->flags);
     g_free(bp);

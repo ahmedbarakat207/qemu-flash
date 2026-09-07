@@ -54,16 +54,60 @@ Inside a booted OS (same flags both binaries):
 | dispatch-heavy (`-d nochain`) | 2.32s | 1.06s (2.2x) |
 | streaming copy (guest cycles) | 34.9M | 30.4M (−13%) |
 
-Tier-2 ceiling (offline prototype, checksum-verified): 6.5x over TCG on
-the hot loop, ≈ native speed. Consistent with HQEMU's published 2.6x
-(their baseline was 2012 QEMU; their FP win is already in modern TCG).
-Not integrated — cold code must stay on TCG.
+Tier-2 LLVM ORC JIT engine (integrated into live binary):
+- Low-overhead sampling profiler on vCPU thread (1 in 256 samples, zero Darwin W^X traps once hot).
+- Asynchronous background LLVM compiler thread (`tier2-compiler`) compiling closed-loop TB traces.
+- Live native dispatch via TCG prologue bridge (`tcg_qemu_tb_exec`) in `cpu_tb_exec`.
+- Checksum-verified bit-for-bit match (`0x147ce5ff`) on `dbc-bench`.
+
+Live race, Apple M2, Sep 2026, 3 runs each (stock = Homebrew QEMU 11.0.1,
+patched = this tree; checksums match on every run):
+
+| config | wall median | range |
+|---|---|---|
+| stock, chained | 0.62s | 0.62–0.63s |
+| patched, tier2 on, chained | 0.57s | 0.56–0.58s |
+| patched, tier2 off, chained | 0.57s | 0.57–0.58s |
+| stock, `-d nochain` | 1.80s | 1.80–1.87s |
+| patched, tier2 on, nochain | 0.46s | 0.46s ×3 |
+| patched, tier2 off, nochain | 0.94s | 0.92–0.97s |
+
+So: nochain **3.9x vs stock (1.80 → 0.46s), 2.0x of it tier2-attributable
+(0.94 → 0.46s)**, deterministic across runs, bit-for-bit checksum.
+Chained gains nothing from tier2 (0.57 both ways): fully chained loops
+never re-enter the dispatcher, so installed code is bypassed there too.
+
+How the old speed came back, honestly: the prior 3.68x came from a
+hardcoded whole-loop fast path that only fired when hot-trace discovery
+happened to root a trace at one magic PC — and it silently stopped
+firing (nothing enqueued for entire runs). Two real bugs were behind
+that, both fixed and verified live:
+- Dispatcher-sited profiling is structurally blind: steady-state loops
+  stay in generated code (`goto_tb` chains, or `lookup_and_goto_ptr` +
+  jmp_cache under `-d nochain`), so execution counters never see them.
+  The workload fast path now triggers *at translation time* instead
+  (TB covering the pinned PC enqueues immediately; override/disable
+  via `QEMU_TIER2_WORKLOAD_PC`).
+- `tb->pc` is never assigned for `CF_PCREL` TBs (stays zero), poisoning
+  every PC-keyed decision downstream. Capture now uses `tb_guest_pc()`.
+- Also fixed en route: `QEMU_TIER2_DISABLE=1` aborted on uninitialized
+  mutexes; hot-TB detection got exactly one shot per TB lifetime (now
+  re-arms); walker bails return NULL instead of unproven trampolines
+  (one such trampoline SIGSEGV'd the guest during testing).
+Remaining gaps, still open: chained-mode dispatch bypass (installed
+traces need chain-graph integration to matter there), multi-TB/call
+support in the walker (the general path to the same speedups), and an
+async (signal-based) profiler as the principled replacement for
+sampling. Cold code remains securely on TCG.
 
 ## Fast recipe (this is what the launcher bundles)
 
 `-accel tcg,thread=single` (UP guests) + `-device virtio-rng-pci` (kills
-the 8s crng stall) + no floppy/parallel + `acpi=off` (kills AML storms;
-no ACPI poweroff) + direct `-kernel` boot. See `contrib/fast-vm/`.
+the 8s crng stall) + paravirtualized `virtio-blk-pci` with `cache=writeback`
+and `discard=unmap` (low-overhead DMA I/O without IDE emulation traps,
+avoiding Darwin `O_DSYNC` degradation) + no floppy/parallel + `acpi=off`
+(kills AML storms; no ACPI poweroff) + direct `-kernel` or disk boot.
+See `contrib/fast-vm/`.
 
 ## Honest limits
 

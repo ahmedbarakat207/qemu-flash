@@ -34,6 +34,7 @@
 #include "tb-hash.h"
 #include "tb-context.h"
 #include "internal-common.h"
+#include "tcg/llvm/tier2.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
 #define runstate_is_running()  true
@@ -786,6 +787,13 @@ void tb_flush__exclusive_or_serial(void)
     tb_remove_all();
 
     tcg_region_reset_all();
+    /*
+     * All TB structs are gone: no compiled trace can survive. Retire
+     * everything, then reclaim ORC resources (exclusive context, no
+     * vCPU can be inside retired code).
+     */
+    tier2_invalidate_all();
+    tier2_reclaim();
     /* XXX: flush processor icache at this point if cache flush is expensive */
     qatomic_inc(&tb_ctx.tb_flush_count);
     qemu_plugin_flush_cb();
@@ -953,6 +961,8 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 
         /* suppress any remaining jumps to this TB */
         tb_jmp_unlink(tb);
+
+        tier2_invalidate(tb);
 
         qatomic_set(&tb_ctx.tb_phys_invalidate_count,
                     tb_ctx.tb_phys_invalidate_count + 1);

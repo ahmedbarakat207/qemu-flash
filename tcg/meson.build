@@ -13,6 +13,7 @@ tcg_ss.add(files(
   'tcg-op-ldst.c',
   'tcg-op-gvec.c',
   'tcg-op-vec.c',
+  'llvm/tier2.c',
 ))
 
 if get_option('tcg_interpreter')

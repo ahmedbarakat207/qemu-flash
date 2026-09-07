@@ -46,6 +46,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
+#include "tcg/llvm/tier2.h"
 #if !defined(CONFIG_USER_ONLY)
 #include "accel/tcg/iommu.h"
 #endif
@@ -434,12 +435,27 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     TranslationBlock *last_tb;
     const void *tb_ptr = itb->tc.ptr;
 
+    tier2_profile_sample(cpu, itb);
+
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
     }
 
     qemu_thread_jit_execute();
-    ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+    /*
+     * Tier-2 dispatch: same return contract as tcg_qemu_tb_exec.
+     * Guards (all cheap): the TB must not have been invalidated, and no
+     * breakpoints may be present (compiled code bypasses QEMU's
+     * breakpoint-page/single-step checks, so any breakpoint forces TCG).
+     */
+    void *tier2_fn = tier2_lookup(itb);
+    if (unlikely(tier2_fn != NULL) && !(tb_cflags(itb) & CF_INVALID) &&
+        likely(QTAILQ_EMPTY(&cpu->breakpoints))) {
+        typedef uintptr_t (*Tier2Func)(CPUArchState *env);
+        ret = ((Tier2Func)tier2_fn)(cpu_env(cpu));
+    } else {
+        ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+    }
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
     /*
@@ -667,6 +683,7 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     trace_link_tb(tb, n, tb_next);
     qemu_log_mask(CPU_LOG_EXEC, "Linking TBs %p index %d -> %p\n",
                   tb->tc.ptr, n, tb_next->tc.ptr);
+    tier2_profile_sample(current_cpu, tb_next);
     return;
 
  out_unlock_next:
@@ -1088,6 +1105,7 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         assert(tcg_ops->get_tb_cpu_state);
         assert(tcg_ops->mmu_index);
         tcg_ops->initialize();
+        tier2_init();
         tcg_target_initialized = true;
     }
 

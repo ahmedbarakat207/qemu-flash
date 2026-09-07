@@ -147,6 +147,11 @@ struct TranslationBlock {
     uintptr_t jmp_list_head;
     uintptr_t jmp_list_next[2];
     uintptr_t jmp_dest[2];
+
+    /* Tier-2 LLVM sampling profiler & compiled trace hook */
+    uint32_t exec_count;
+    bool tier2_enqueued;
+    void *tier2_code;
 };
 
 /* The alignment given to TranslationBlock during allocation. */
