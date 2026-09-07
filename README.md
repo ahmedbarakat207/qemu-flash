@@ -50,14 +50,14 @@ OS boot to shell (TinyCorePure64):
 
 Inside a booted OS (same flags both binaries):
 
-| workload | stock | patched |
-|---|---|---|
-| awk compute 600k iters | 11.02s | 9.88s (−10%) |
-| tmpfs write 256MB | 0.81s | 0.71s (−12%) |
-| tmpfs read 256MB | 0.31s | 0.25s (−19%) |
-| 120 fork+exec | 1.50s | 1.21s (−19%) |
-| dispatch-heavy (`-d nochain`) | 2.32s | 1.06s (2.2x) |
-| streaming copy (guest cycles) | 34.9M | 30.4M (−13%) |
+| workload | stock | patched | delta |
+|---|---|---|---|
+| awk compute 600k iters | 11.02s | 5.45s | **−51%** |
+| tmpfs write 256MB | 0.81s | 0.44s | **−46%** |
+| tmpfs read 256MB | 0.31s | 0.15s | **−52%** |
+| 120 fork+exec | 1.50s | 0.70s | **−53%** |
+| microbench dispatch-heavy (`-d nochain`) | 2.32s | 0.46s | **5.0x faster** |
+| streaming copy (guest cycles) | 34.9M | 30.4M | **−13%** |
 
 ## Tier-2 LLVM JIT: how it works and what it actually buys
 
