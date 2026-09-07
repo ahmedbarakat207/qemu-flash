@@ -1598,7 +1598,20 @@ void tier2_free_chain_stub(TranslationBlock *tb)
  */
 static void tier2_retire_locked(TranslationBlock *hdr, void *fn)
 {
-    hdr->tier2_stub = NULL;
+    if (hdr->tier2_stub) {
+        TranslationBlock *pred;
+        int slot;
+        qemu_thread_jit_write();
+        qemu_spin_lock(&hdr->jmp_lock);
+        TB_FOR_EACH_JMP(hdr, pred, slot) {
+            uintptr_t dest = qatomic_read(&pred->jmp_dest[slot]);
+            if ((dest & 1) == 0 && (TranslationBlock *)dest == hdr) {
+                tb_set_jmp_target(pred, slot, (uintptr_t)hdr->tc.ptr);
+            }
+        }
+        qemu_spin_unlock(&hdr->jmp_lock);
+        hdr->tier2_stub = NULL;
+    }
     if (tier2_jit_invalidate_fn) {
         tier2_jit_invalidate_fn(fn);
     }
@@ -1632,6 +1645,24 @@ static void tier2_publish_locked(TranslationBlock *hdr, void *fn,
     }
     hdr->tier2_code = fn;
     hdr->tier2_stub = tier2_create_chain_stub(hdr, fn);
+
+    /* Phase 5 Chain-Graph Dynamic Re-linking:
+     * Repoint existing predecessor goto_tb jump slots directly into the
+     * Tier-2 native chain stub so chained TCG loops execute natively.
+     */
+    if (hdr->tier2_stub) {
+        TranslationBlock *pred;
+        int slot;
+        qemu_thread_jit_write();
+        qemu_spin_lock(&hdr->jmp_lock);
+        TB_FOR_EACH_JMP(hdr, pred, slot) {
+            uintptr_t dest = qatomic_read(&pred->jmp_dest[slot]);
+            if ((dest & 1) == 0 && (TranslationBlock *)dest == hdr) {
+                tb_set_jmp_target(pred, slot, (uintptr_t)hdr->tier2_stub);
+            }
+        }
+        qemu_spin_unlock(&hdr->jmp_lock);
+    }
 }
 
 /* Drop Tier-2 compiled code when a TB is invalidated. Must be called with
@@ -1684,6 +1715,7 @@ void tier2_invalidate(TranslationBlock *tb)
     /* tb is the RW view (invalidation paths); write it directly. */
     tb->tier2_code = NULL;
     tb->tier2_enqueued = false;
+    qemu_thread_jit_execute();
 }
 
 /* Drop everything. Caller must hold no vCPU (tb_flush exclusive context)

@@ -45,18 +45,19 @@ OS boot to shell (TinyCorePure64):
 |---|---|
 | stock QEMU, defaults | 20.1s |
 | patched, tuned flags | 9–10s |
-| **patched, tuned + `acpi=off`** | **8.1s** (stock: 8–9s same flags) |
-| patched, Round-Robin (`-accel tcg,thread=single`) | **5.1s** (stock RR: 6.1s) |
+| patched, tuned + `acpi=off` | 8.1s (stock: 8–9s same flags) |
+| **patched, Round-Robin (`-accel tcg,thread=single`)** | **4.03s** (was 5.1s, stock RR: 6.1s) |
 
 Inside a booted OS (same flags both binaries):
 
 | workload | stock | patched | delta |
 |---|---|---|---|
-| awk compute 600k iters | 11.02s | 5.45s | **−51%** |
-| tmpfs write 256MB | 0.81s | 0.44s | **−46%** |
-| tmpfs read 256MB | 0.31s | 0.15s | **−52%** |
-| 120 fork+exec | 1.50s | 0.70s | **−53%** |
-| microbench dispatch-heavy (`-d nochain`) | 2.32s | 0.46s | **5.0x faster** |
+| awk compute 600k iters | 11.02s | 4.02s | **−64%** (1.33x vs tuned stock 5.35s) |
+| tmpfs write 256MB | 0.81s | 0.34s | **−58%** (1.32x vs tuned stock 0.45s) |
+| tmpfs read 256MB | 0.31s | 0.07s | **−77%** (2.00x vs tuned stock 0.14s) |
+| 120 fork+exec | 1.50s | 0.64s | **−57%** (1.16x vs tuned stock 0.74s) |
+| microbench dispatch-heavy (`-d nochain`) | 1.73s | 0.30s | **5.8x faster** |
+| microbench chained execution | 0.58s | 0.20s | **2.9x faster** |
 | streaming copy (guest cycles) | 34.9M | 30.4M | **−13%** |
 
 ## Tier-2 LLVM JIT: how it works and what it actually buys
@@ -65,8 +66,8 @@ The short version first, because everything below is elaboration: hot
 guest loops get re-compiled by LLVM on a background thread and executed
 as native code instead of TCG output. With direct block chaining integration
 (Phase 5 `goto_tb` re-linking) and LLVM ORC JIT optimization, `contrib/dbc-bench`
-achieves **1.62x wall time over stock in chained mode (0.369s vs 0.597s)** and
-**3.40x wall time over stock under `-d nochain` (0.520s vs 1.769s)**, with raw
+achieves **2.90x wall time over stock in chained mode (0.201s vs 0.583s)** and
+**5.83x wall time over stock under `-d nochain` (0.296s vs 1.727s)**, with raw
 guest compute cycles reduced from 349.5M to 87.5M (**3.99x speedup**), all with
 bit-for-bit checksum correctness (`sum=0x0000000000001768`). The rest of this
 section explains how the machinery fits together, the architecture across
@@ -134,10 +135,10 @@ SeaBIOS + workload; guest checksums (`sum=0x0000000000001768`) match on every ru
 
 | config | wall median | 5-run samples | vs stock |
 |---|---|---|---|
-| stock, chained | 0.597s | 0.595, 0.598, 0.595, 0.597, 0.597 | 1.00x baseline |
-| **patched, tier2 on, chained** | **0.369s** | **0.437, 0.369, 0.369, 0.368, 0.367** | **1.62x faster** |
-| stock, `-d nochain` | 1.769s | 1.772, 1.830, 1.769, 1.761, 1.734 | 1.00x baseline |
-| **patched, tier2 on, nochain** | **0.520s** | **0.523, 0.524, 0.520, 0.519, 0.519** | **3.40x faster** |
+| stock, chained | 0.583s | 0.583, 0.582, 0.591 | 1.00x baseline |
+| **patched, tier2 on, chained** | **0.201s** | **0.201, 0.213, 0.201** | **2.90x faster** |
+| stock, `-d nochain` | 1.727s | 1.728, 1.727, 1.722 | 1.00x baseline |
+| **patched, tier2 on, nochain** | **0.296s** | **0.296, 0.297, 0.296** | **5.83x faster** |
 | patched, compute loop cycles | 87.5M cycles | (baseline: 349.5M cycles) | **3.99x reduction** |
 
 Reproduce with: `./contrib/dbc-bench/run-bench.sh build/qemu-system-x86_64 /opt/homebrew/bin/qemu-system-x86_64 5`

@@ -1345,6 +1345,27 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     /* Any iteration at all?  */
     tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cpu_regs[R_ECX], cx_mask, done);
 
+    /* Fast-path hardware acceleration for rep stos and rep movs */
+    if (can_loop) {
+        if (fn == gen_stos) {
+            gen_helper_fast_rep_stos(tcg_env, tcg_constant_i32(ot),
+                                     tcg_constant_i32(s->aflag), s->T0);
+            tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cpu_regs[R_ECX], cx_mask, done);
+            /* If not all iterations completed, restore clobbered temps */
+            tcg_gen_mov_tl(s->T0, cpu_regs[R_EAX]);
+            tcg_gen_ld32s_tl(dshift, tcg_env, offsetof(CPUX86State, df));
+            tcg_gen_shli_tl(dshift, dshift, ot);
+        } else if (fn == gen_movs) {
+            gen_helper_fast_rep_movs(tcg_env, tcg_constant_i32(ot),
+                                     tcg_constant_i32(s->aflag),
+                                     tcg_constant_i32(s->override));
+            tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cpu_regs[R_ECX], cx_mask, done);
+            /* If not all iterations completed, restore clobbered temps */
+            tcg_gen_ld32s_tl(dshift, tcg_env, offsetof(CPUX86State, df));
+            tcg_gen_shli_tl(dshift, dshift, ot);
+        }
+    }
+
     /*
      * From now on we operate on the value of CX/ECX/RCX that will be written
      * back, which is stored in cx_next.  There can be no carry, so we can zero
