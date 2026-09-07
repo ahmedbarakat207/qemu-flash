@@ -57,6 +57,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/Host.h"
 #include <sys/stat.h>
+#include "hle-thunks.h"
 
 using namespace llvm;
 using namespace llvm::orc;
@@ -446,18 +447,23 @@ static Value *useTemp(IRBuilder<> &B, WalkState &S, uint32_t tb, int32_t t,
         if (tr.tbits == 32) {
             v &= 0xffffffffULL;
         }
-        return B.getInt64(v);
+        Type *cTy = tr.tbits >= 128 ? IntegerType::get(S.C, tr.tbits) : S.I64;
+        return ConstantInt::get(cTy, v);
     }
     auto it = S.cells.find(cellKey(S, tb, t));
     if (it == S.cells.end()) {
         ok = false;
         return nullptr;
     }
-    Value *v = B.CreateLoad(S.I64, it->second);
+    Type *loadTy = tr.tbits >= 128 ? IntegerType::get(S.C, tr.tbits) : S.I64;
+    Value *v = B.CreateLoad(loadTy, it->second);
     /* Mask at use as well as def: shared env cells may hold a wider
      * value than this view's width (mixed-width views of one slot).
      * Masking is idempotent, so single-width streams are unaffected. */
-    return maskTo(B, v, tr.tbits == 32 ? 32 : 64);
+    if (tr.tbits < 64) {
+        v = maskTo(B, v, tr.tbits == 32 ? 32 : 64);
+    }
+    return v;
 }
 
 /*
@@ -469,7 +475,9 @@ static void defTemp(IRBuilder<> &B, WalkState &S, uint32_t tb, int32_t t,
                     Value *v)
 {
     const Tier2TempRec &tr = S.trace->recs[tb].temps[t];
-    v = maskTo(B, v, tr.tbits == 32 ? 32 : 64);
+    if (tr.tbits < 64) {
+        v = maskTo(B, v, tr.tbits == 32 ? 32 : 64);
+    }
     auto it = S.cells.find(cellKey(S, tb, t));
     if (it != S.cells.end()) {
         B.CreateStore(v, it->second);
@@ -766,6 +774,45 @@ static bool emitGuestMem(IRBuilder<> &B, WalkState &S, const Tier2OpRec &op,
     };
 
     const Tier2TlbLayout &T = S.trace->tlb;
+    if (S.trace->ram_base != 0 && !forbidden) {
+        /* Phase 3: Flat RAM direct host pointer lowering */
+        Function *F = B.GetInsertBlock()->getParent();
+        BasicBlock *direct = BasicBlock::Create(C, "ram_direct", F);
+        BasicBlock *fallback = BasicBlock::Create(C, "ram_fallback", F);
+        BasicBlock *cont = BasicBlock::Create(C, "ram_cont", F);
+
+        Value *in_range = B.CreateICmpULT(addr, B.getInt64(S.trace->ram_size));
+        B.CreateCondBr(in_range, direct, fallback);
+
+        B.SetInsertPoint(direct);
+        Value *base_ptr = B.CreateIntToPtr(B.getInt64(S.trace->ram_base), PtrTy);
+        Value *hptr = B.CreateGEP(B.getInt8Ty(), base_ptr, addr);
+        Type *accTy = size == 1 ? Type::getInt8Ty(C) :
+                      size == 2 ? Type::getInt16Ty(C) :
+                      size == 4 ? Type::getInt32Ty(C) : I64;
+        Value *d_val = nullptr;
+        if (isLoad) {
+            Value *raw = B.CreateLoad(accTy, hptr);
+            d_val = sign ? B.CreateSExt(raw, I64) : B.CreateZExt(raw, I64);
+        } else {
+            Value *st_val = (size == 8) ? val : B.CreateTrunc(val, accTy);
+            B.CreateStore(st_val, hptr);
+        }
+        B.CreateBr(cont);
+
+        B.SetInsertPoint(fallback);
+        Value *slow_val = emitGuestMemSlow(B, S, op, isLoad, addr, val, hname);
+        B.CreateBr(cont);
+
+        B.SetInsertPoint(cont);
+        if (isLoad) {
+            PHINode *phi = B.CreatePHI(I64, 2);
+            phi->addIncoming(d_val, direct);
+            phi->addIncoming(slow_val, fallback);
+            return finishLoad(phi);
+        }
+        return true;
+    }
     if (!T.valid || forbidden) {
         /* Helper-only: user mode, byteswapped data, parallel atomics. */
         Value *r = emitGuestMemSlow(B, S, op, isLoad, addr, val, hname);
@@ -1043,7 +1090,7 @@ static bool emitTB(IRBuilder<> &B, WalkState &S, uint32_t tb)
             }
         }
         unsigned b = op.bits ? op.bits : 64;
-        if (b != 32 && b != 64) {
+        if (b != 32 && b != 64 && b != 128 && b != 256) {
             return false;
         }
         auto U = [&](int32_t t) -> Value * { return useTemp(B, S, tb, t, ok); };
@@ -1416,6 +1463,68 @@ static bool emitTB(IRBuilder<> &B, WalkState &S, uint32_t tb)
                                                   B.CreateZExt(c, S.I64)));
             break;
         }
+        /* Phase 4: Vector / SIMD Transpilation (x86 SSE/AVX -> ARM64 NEON) */
+        case T2_VEC_ADD:
+        case T2_VEC_SUB:
+        case T2_VEC_MUL:
+        case T2_VEC_AND:
+        case T2_VEC_OR:
+        case T2_VEC_XOR:
+        case T2_VEC_NOT:
+        case T2_VEC_DUP: {
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            unsigned elemBits = op.imm1 ? (unsigned)op.imm1 : 32;
+            unsigned totalBits = op.bits ? op.bits : 128;
+            unsigned lanes = totalBits / elemBits;
+            Type *elemTy = (elemBits == 8) ? Type::getInt8Ty(C) :
+                           (elemBits == 16) ? Type::getInt16Ty(C) :
+                           (elemBits == 32) ? Type::getInt32Ty(C) : S.I64;
+            Type *vecTy = FixedVectorType::get(elemTy, lanes);
+            Value *v1 = U(op.src1);
+            Value *v2 = (op.src2 >= 0) ? U(op.src2) : nullptr;
+            Value *vec1 = B.CreateBitCast(v1, vecTy);
+            Value *vec2 = v2 ? B.CreateBitCast(v2, vecTy) : nullptr;
+            Value *res = nullptr;
+            switch (op.op) {
+            case T2_VEC_ADD: res = B.CreateAdd(vec1, vec2); break;
+            case T2_VEC_SUB: res = B.CreateSub(vec1, vec2); break;
+            case T2_VEC_MUL: res = B.CreateMul(vec1, vec2); break;
+            case T2_VEC_AND: res = B.CreateAnd(vec1, vec2); break;
+            case T2_VEC_OR:  res = B.CreateOr(vec1, vec2); break;
+            case T2_VEC_XOR: res = B.CreateXor(vec1, vec2); break;
+            case T2_VEC_NOT: res = B.CreateNot(vec1); break;
+            case T2_VEC_DUP: {
+                Value *scalar = (elemBits == 64) ? v1 : B.CreateTrunc(v1, elemTy);
+                res = B.CreateVectorSplat(lanes, scalar);
+                break;
+            }
+            default: break;
+            }
+            if (res) {
+                Type *dstCellTy = IntegerType::get(C, totalBits);
+                defTemp(B, S, tb, op.dst, B.CreateBitCast(res, dstCellTy));
+            }
+            break;
+        }
+        case T2_VEC_LD: {
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            unsigned totalBits = op.bits ? op.bits : 128;
+            Type *vecIntTy = IntegerType::get(C, totalBits);
+            Value *addr = U(op.src1);
+            Value *ptr = B.CreateIntToPtr(addr, PointerType::get(C, 0));
+            Value *val = B.CreateAlignedLoad(vecIntTy, ptr, Align(16));
+            defTemp(B, S, tb, op.dst, val);
+            break;
+        }
+        case T2_VEC_ST: {
+            unsigned totalBits = op.bits ? op.bits : 128;
+            Type *vecIntTy = IntegerType::get(C, totalBits);
+            Value *val = U(op.src1);
+            Value *addr = U(op.src2);
+            Value *ptr = B.CreateIntToPtr(addr, PointerType::get(C, 0));
+            B.CreateAlignedStore(val, ptr, Align(16));
+            break;
+        }
         case T2_BR: {
             BasicBlock *dst = nullptr;
             if (!needLabel(op.imm1, dst)) { return false; }
@@ -1748,9 +1857,11 @@ static bool tryCompileOps(Module *M, LLVMContext &C, Function *F,
                 if (!tr.is_const) {
                     auto key = std::make_pair(t, (uint64_t)(uint32_t)i);
                     if (!S.cells.count(key)) {
-                        Value *cell = B.CreateAlloca(S.I64, nullptr, "t");
+                        unsigned tb_bits = tr.tbits >= 128 ? tr.tbits : 64;
+                        Type *cellTy = IntegerType::get(C, tb_bits);
+                        Value *cell = B.CreateAlloca(cellTy, nullptr, "t");
                         S.cells[key] = cell;
-                        B.CreateStore(B.getInt64(0), cell);
+                        B.CreateStore(ConstantInt::get(cellTy, 0), cell);
                     }
                 }
                 continue;
@@ -1771,6 +1882,15 @@ static bool tryCompileOps(Module *M, LLVMContext &C, Function *F,
                 B.CreateStore(init, cell);
             }
         }
+    }
+
+    /* Phase 5: Record active TB pointer in CPUState for exit resolution */
+    if (trace->has_safepoint && trace->last_tb_off != 0 && trace->rx_header != nullptr) {
+        Value *cpu = B.CreateGEP(B.getInt8Ty(), S.envI8, B.getInt64(trace->cpu_off));
+        Value *last_tb_ptr = B.CreateBitCast(
+            B.CreateGEP(B.getInt8Ty(), cpu, B.getInt64(trace->last_tb_off)),
+            PointerType::get(C, 0));
+        B.CreateStore(B.getInt64((uint64_t)(uintptr_t)trace->rx_header), last_tb_ptr);
     }
 
     B.CreateBr(S.entries[trace->header_idx]);
@@ -1940,6 +2060,9 @@ static uint64_t tier2CacheKey(const Tier2TraceDesc *trace)
         h = fnv1a(&sp, 1, h);
         h = fnv1a(&trace->cpu_off, sizeof(trace->cpu_off), h);
         h = fnv1a(&trace->irq_off, sizeof(trace->irq_off), h);
+        h = fnv1a(&trace->last_tb_off, sizeof(trace->last_tb_off), h);
+        h = fnv1a(&trace->ram_base, sizeof(trace->ram_base), h);
+        h = fnv1a(&trace->ram_size, sizeof(trace->ram_size), h);
     }
     if (getenv("QEMU_TIER2_DEBUG")) {
         fprintf(stderr, "[tier2-jit] keyinputs n=%u hidx=%u sp=%d cpuoff=%lld irqoff=%lld gm=%d next0=%d slot0=%d\n",
@@ -2102,7 +2225,7 @@ static bool cacheStore(uint64_t key, Module *M)
             Triple triple{sys::getProcessTriple()};
             std::string err;
             const Target *tgt =
-                TargetRegistry::lookupTarget(triple.getTriple(), err);
+                TargetRegistry::lookupTarget(triple, err);
             if (!tgt) {
                 return false;
             }
@@ -3521,6 +3644,207 @@ extern "C" bool tier2_jit_selftest(void)
         return false;
     }
     printf("[tier2-selftest] trace16 safepoint poll OK\n");
+
+    /*
+     * Trace 17: Phase 4 Vector / SIMD Transpilation (ARM64 NEON).
+     * Exercises 128-bit vector load, 4x32 vector add, vector broadcast/xor,
+     * and 128-bit vector store against a reference C++ calculation.
+     */
+    static uint32_t v_inA[4] = { 100, 200, 300, 400 };
+    static uint32_t v_inB[4] = { 11,  22,  33,  44 };
+    static uint32_t v_out[4] = { 0,   0,   0,   0 };
+    static uint64_t v_env[4];
+    v_env[0] = (uint64_t)(uintptr_t)&v_inA[0];
+    v_env[1] = (uint64_t)(uintptr_t)&v_inB[0];
+    v_env[2] = (uint64_t)(uintptr_t)&v_out[0];
+
+    auto t17 = std::make_unique<Tier2TraceDesc>();
+    memset(t17.get(), 0, sizeof(*t17));
+    t17->num_tbs = 1;
+    t17->has_ops = true;
+    t17->trace_id = 17;
+    t17->header_pc = 0xF000;
+    t17->rx_header = (const void *)0xF000;
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t17->next[i] = -1;
+        t17->next_slot[i] = -1;
+    }
+    t17->header_idx = 0;
+    Tier2TBRec &r17 = t17->recs[0];
+    r17.pc = 0xF000;
+    r17.rx_tb = (const void *)0xF000;
+    r17.num_temps = 9;
+    mkTemp(r17, 0, false, false, 64, -1, 0);  // ptr A
+    mkTemp(r17, 1, false, false, 64, -1, 0);  // ptr B
+    mkTemp(r17, 2, false, false, 64, -1, 0);  // ptr Out
+    mkTemp(r17, 3, true, false, 64, -1, 0x55); // mask scalar
+    mkTemp(r17, 4, false, false, 128, -1, 0); // vec A
+    mkTemp(r17, 5, false, false, 128, -1, 0); // vec B
+    mkTemp(r17, 6, false, false, 128, -1, 0); // vec Add
+    mkTemp(r17, 7, false, false, 128, -1, 0); // vec Mask
+    mkTemp(r17, 8, false, false, 128, -1, 0); // vec Res
+
+    std::vector<Tier2OpRec> o17;
+    // Load ptrs from env
+    o17.push_back(mkOp(T2_LD64, 64, 0, -1, -1, -1, -1, 0, 0));
+    o17.push_back(mkOp(T2_LD64, 64, 1, -1, -1, -1, -1, 8, 0));
+    o17.push_back(mkOp(T2_LD64, 64, 2, -1, -1, -1, -1, 16, 0));
+    // Vector loads
+    o17.push_back(mkOp(T2_VEC_LD, 128, 4, 0, -1, -1, -1, 32, 0));
+    o17.push_back(mkOp(T2_VEC_LD, 128, 5, 1, -1, -1, -1, 32, 0));
+    // Vector add: 4x32
+    o17.push_back(mkOp(T2_VEC_ADD, 128, 6, 4, 5, -1, -1, 32, 0));
+    // Vector broadcast mask: 4x32 from scalar temp 3
+    o17.push_back(mkOp(T2_VEC_DUP, 128, 7, 3, -1, -1, -1, 32, 0));
+    // Vector xor: 4x32
+    o17.push_back(mkOp(T2_VEC_XOR, 128, 8, 6, 7, -1, -1, 32, 0));
+    // Vector store to ptr Out
+    o17.push_back(mkOp(T2_VEC_ST, 128, -1, 8, 2, -1, -1, 32, 0));
+    o17.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0xF000, 0));
+
+    r17.num_ops = (uint32_t)o17.size();
+    for (size_t i = 0; i < o17.size(); i++) {
+        r17.ops[i] = o17[i];
+    }
+    void *fn17 = tier2_jit_compile_trace(t17.get());
+    if (!fn17) {
+        fprintf(stderr, "[tier2-selftest] trace17 failed to compile\n");
+        return false;
+    }
+    if (((FnT)fn17)(v_env) != (TIER2_EXIT_PROTOCOL | 0)) {
+        fprintf(stderr, "[tier2-selftest] trace17 return code mismatch\n");
+        return false;
+    }
+    for (int k = 0; k < 4; k++) {
+        uint32_t expected = (v_inA[k] + v_inB[k]) ^ 0x55;
+        if (v_out[k] != expected) {
+            fprintf(stderr, "[tier2-selftest] trace17 lane %d mismatch: got %u, expected %u\n",
+                    k, v_out[k], expected);
+            return false;
+        }
+    }
+    printf("[tier2-selftest] trace17 NEON vector SIMD OK\n");
+
+    /* -------------------------------------------------------------- */
+    /* Trace 18: High-Level Emulation (HLE) Library Shims & Thunks    */
+    /* Differential verification of SysV x86_64 -> Host AAPCS64 math,  */
+    /* memory, and crypto shims.                                      */
+    /* -------------------------------------------------------------- */
+    hle_thunk_init();
+    hle_thunk_reset();
+    assert(hle_thunk_register_address("sin", 0x100010));
+    assert(hle_thunk_register_address("cos", 0x100020));
+    assert(hle_thunk_register_address("pow", 0x100030));
+    assert(hle_thunk_register_address("sqrt", 0x100040));
+    assert(hle_thunk_register_address("atan2", 0x100050));
+    assert(hle_thunk_register_address("strlen", 0x100060));
+    assert(hle_thunk_register_address("memcpy", 0x100070));
+    assert(hle_thunk_register_address("memset", 0x100080));
+    assert(hle_thunk_register_address("SHA256_Init", 0x100090));
+    assert(hle_thunk_register_address("SHA256_Update", 0x1000a0));
+    assert(hle_thunk_register_address("SHA256_Final", 0x1000b0));
+
+    struct TestX86Env {
+        uint64_t regs[16];
+        uint64_t eip;
+        uint64_t eflags;
+        uint8_t  _pad[1024];
+        union {
+            uint8_t  _b[64];
+            uint32_t _l[16];
+            uint64_t _q[8];
+            float    _s[16];
+            double   _d[8];
+        } xmm[32];
+    } hle_env;
+    memset(&hle_env, 0, sizeof(hle_env));
+
+    uint64_t fake_stack[16];
+    memset(fake_stack, 0, sizeof(fake_stack));
+
+    // 1. Math: sin(pi / 3)
+    fake_stack[0] = 0xbeefcafeULL;
+    hle_env.regs[4] = (uintptr_t)&fake_stack[0]; // R_ESP = 4
+    hle_env.xmm[0]._d[0] = 1.0471975511965976;
+    if (!hle_thunk_dispatch(&hle_env, 0x100010, nullptr)) {
+        fprintf(stderr, "[tier2-selftest] trace18 sin thunk dispatch failed\n");
+        return false;
+    }
+    if (std::abs(hle_env.xmm[0]._d[0] - sin(1.0471975511965976)) > 1e-15 ||
+        hle_env.eip != 0xbeefcafeULL ||
+        hle_env.regs[4] != (uintptr_t)&fake_stack[1]) {
+        fprintf(stderr, "[tier2-selftest] trace18 sin thunk result mismatch\n");
+        return false;
+    }
+
+    // 2. Math: pow(2.0, 10.0) == 1024.0
+    fake_stack[1] = 0x12345678ULL;
+    hle_env.regs[4] = (uintptr_t)&fake_stack[1];
+    hle_env.xmm[0]._d[0] = 2.0;
+    hle_env.xmm[1]._d[0] = 10.0;
+    if (!hle_thunk_dispatch(&hle_env, 0x100030, nullptr) ||
+        hle_env.xmm[0]._d[0] != 1024.0 ||
+        hle_env.eip != 0x12345678ULL) {
+        fprintf(stderr, "[tier2-selftest] trace18 pow thunk result mismatch\n");
+        return false;
+    }
+
+    // 3. String: strlen
+    fake_stack[2] = 0x87654321ULL;
+    hle_env.regs[4] = (uintptr_t)&fake_stack[2];
+    const char *test_str = "HighPerformanceTier2JIT";
+    hle_env.regs[7] = (uintptr_t)test_str; // R_EDI = 7
+    if (!hle_thunk_dispatch(&hle_env, 0x100060, nullptr) ||
+        hle_env.regs[0] != strlen(test_str) || // R_EAX = 0
+        hle_env.eip != 0x87654321ULL) {
+        fprintf(stderr, "[tier2-selftest] trace18 strlen thunk result mismatch\n");
+        return false;
+    }
+
+    // 4. Memory: memcpy
+    fake_stack[3] = 0xaaaabbbbULL;
+    hle_env.regs[4] = (uintptr_t)&fake_stack[3];
+    char src_buf[32] = "TestingDirectHleThunk";
+    char dst_buf[32] = {0};
+    hle_env.regs[7] = (uintptr_t)dst_buf;
+    hle_env.regs[6] = (uintptr_t)src_buf; // R_ESI = 6
+    hle_env.regs[2] = strlen(src_buf) + 1; // R_EDX = 2
+    if (!hle_thunk_dispatch(&hle_env, 0x100070, nullptr) ||
+        strcmp(dst_buf, src_buf) != 0 ||
+        hle_env.regs[0] != (uintptr_t)dst_buf) {
+        fprintf(stderr, "[tier2-selftest] trace18 memcpy thunk result mismatch\n");
+        return false;
+    }
+
+    // 5. Crypto: SHA256("hello world")
+    // Known SHA-256: b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace20c
+    uint8_t sha_ctx[256];
+    fake_stack[4] = 0xccccddddULL;
+    hle_env.regs[4] = (uintptr_t)&fake_stack[4];
+    hle_env.regs[7] = (uintptr_t)sha_ctx;
+    if (!hle_thunk_dispatch(&hle_env, 0x100090, nullptr)) {
+        return false;
+    }
+    const char *sha_msg = "hello world";
+    fake_stack[4] = 0xccccddddULL;
+    hle_env.regs[4] = (uintptr_t)&fake_stack[4];
+    hle_env.regs[7] = (uintptr_t)sha_ctx;
+    hle_env.regs[6] = (uintptr_t)sha_msg;
+    hle_env.regs[2] = strlen(sha_msg);
+    if (!hle_thunk_dispatch(&hle_env, 0x1000a0, nullptr)) {
+        return false;
+    }
+    uint8_t digest[32];
+    fake_stack[4] = 0xccccddddULL;
+    hle_env.regs[4] = (uintptr_t)&fake_stack[4];
+    hle_env.regs[7] = (uintptr_t)digest;
+    hle_env.regs[6] = (uintptr_t)sha_ctx;
+    if (!hle_thunk_dispatch(&hle_env, 0x1000b0, nullptr) ||
+        digest[0] != 0xb9 || digest[1] != 0x4d || digest[2] != 0x27 || digest[3] != 0xb9) {
+        fprintf(stderr, "[tier2-selftest] trace18 sha256 thunk result mismatch\n");
+        return false;
+    }
+    printf("[tier2-selftest] trace18 HLE library shims OK\n");
 
     printf("[tier2-selftest] ALL GREEN\n");
     return true;

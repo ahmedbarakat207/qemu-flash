@@ -44,6 +44,7 @@
 #endif
 #include "trace.h"
 
+#ifndef TB_FOR_EACH_JMP
 /* List iterators for lists of tagged pointers in TranslationBlock. */
 #define TB_FOR_EACH_TAGGED(head, tb, n, field)                          \
     for (n = (head) & 1, tb = (TranslationBlock *)((head) & ~1);        \
@@ -52,6 +53,7 @@
 
 #define TB_FOR_EACH_JMP(head_tb, tb, n)                                 \
     TB_FOR_EACH_TAGGED((head_tb)->jmp_list_head, tb, n, jmp_list_next)
+#endif
 
 static bool tb_cmp(const void *ap, const void *bp)
 {

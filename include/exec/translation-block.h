@@ -152,6 +152,7 @@ struct TranslationBlock {
     uint32_t exec_count;
     bool tier2_enqueued;
     void *tier2_code;
+    void *tier2_stub;
     /*
      * RCU-installed trace record for tier-2 side exits (exit protocol):
      * lets compiled code return small (tb-index, exit-idx) codes that
@@ -162,6 +163,15 @@ struct TranslationBlock {
      */
     struct Tier2Installed *tier2_rec;
 };
+
+/* List iterators for lists of tagged pointers in TranslationBlock. */
+#define TB_FOR_EACH_TAGGED(head, tb, n, field)                          \
+    for (n = (head) & 1, tb = (TranslationBlock *)((head) & ~1);        \
+         tb; tb = (TranslationBlock *)tb->field[n], n = (uintptr_t)tb & 1, \
+             tb = (TranslationBlock *)((uintptr_t)tb & ~1))
+
+#define TB_FOR_EACH_JMP(head_tb, tb, n)                                 \
+    TB_FOR_EACH_TAGGED((head_tb)->jmp_list_head, tb, n, jmp_list_next)
 
 /* The alignment given to TranslationBlock during allocation. */
 #define CODE_GEN_ALIGN  16

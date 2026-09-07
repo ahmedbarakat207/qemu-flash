@@ -28,6 +28,7 @@
 #include "target_elf.h"
 #include "target_signal.h"
 #include "tcg/debuginfo.h"
+#include "hle-thunks.h"
 
 #ifdef TARGET_ARM
 #include "target/arm/cpu-features.h"
@@ -1466,6 +1467,9 @@ static void load_symbols(struct elfhdr *hdr, const ImageSource *src,
             syms[i].st_value &= ~(target_ulong)1;
 #endif
             syms[i].st_value += load_bias;
+            if (strings && syms[i].st_name < segsz) {
+                hle_thunk_register_address(strings + syms[i].st_name, syms[i].st_value);
+            }
             i++;
         }
     }

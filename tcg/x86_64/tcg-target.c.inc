@@ -4515,6 +4515,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
     /* TB epilogue */
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
+    tcg_tb_ret_addr = tb_ret_addr;
 
     tcg_out_addi(s, TCG_REG_CALL_STACK, stack_addend);
 

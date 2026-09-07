@@ -11,6 +11,7 @@ linux_user_ss.add(files(
   'elfload.c',
   'exit.c',
   'fd-trans.c',
+  'hle-thunks.c',
   'linuxload.c',
   'main.c',
   'mmap.c',

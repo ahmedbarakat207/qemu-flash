@@ -583,6 +583,9 @@ struct CPUState {
     /* track IOMMUs whose translations we've cached in the TCG TLB */
     GArray *iommu_notifiers;
 
+    /* Tier-2 active trace tracking for chained execution (Phase 5) */
+    struct TranslationBlock *last_tier2_tb;
+
     /*
      * MUST BE LAST in order to minimize the displacement to CPUArchState.
      */

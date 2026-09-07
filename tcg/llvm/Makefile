@@ -15,9 +15,18 @@ LLVM_SYSLIBS := $(shell $(LLVM_CONFIG) --system-libs)
 
 all: $(TARGET)
 
-$(TARGET): tier2-jit.cpp tier2-jit.h
+CC ?= clang
+HLE_SRC := $(REPO_ROOT)/linux-user/hle-thunks.c
+HLE_HDR := $(REPO_ROOT)/linux-user/hle-thunks.h
+HLE_OBJ := $(BUILD_DIR)/hle-thunks.o
+
+$(HLE_OBJ): $(HLE_SRC) $(HLE_HDR)
 	mkdir -p $(BUILD_DIR)
-	$(CXX) -std=c++17 -O2 -shared -fPIC -Itcg/llvm -I. -o $@ tier2-jit.cpp \
+	$(CC) -std=c11 -O2 -fPIC -Ilinux-user -I$(REPO_ROOT)/linux-user -c -o $@ $(HLE_SRC)
+
+$(TARGET): tier2-jit.cpp tier2-jit.h $(HLE_OBJ)
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -shared -fPIC -Itcg/llvm -I. -Ilinux-user -I$(REPO_ROOT)/linux-user -o $@ tier2-jit.cpp $(HLE_OBJ) \
 	    $(LLVM_CXXFLAGS) \
 	    $(LLVM_LDFLAGS) \
 	    $(LLVM_LIBS) \
@@ -27,9 +36,9 @@ $(TARGET): tier2-jit.cpp tier2-jit.h
 # streams and differential-checks them against C++ references.
 selftest: $(SELFTEST)
 
-$(SELFTEST): tier2-jit.cpp tier2-jit.h
+$(SELFTEST): tier2-jit.cpp tier2-jit.h $(HLE_OBJ)
 	mkdir -p $(BUILD_DIR)
-	$(CXX) -std=c++17 -O2 -DTIER2_JIT_SELFTEST_MAIN -Itcg/llvm -I. -o $@ tier2-jit.cpp \
+	$(CXX) -std=c++17 -O2 -DTIER2_JIT_SELFTEST_MAIN -Itcg/llvm -I. -Ilinux-user -I$(REPO_ROOT)/linux-user -o $@ tier2-jit.cpp $(HLE_OBJ) \
 	    $(LLVM_CXXFLAGS) \
 	    $(LLVM_LDFLAGS) \
 	    $(LLVM_LIBS) \
@@ -38,9 +47,9 @@ $(SELFTEST): tier2-jit.cpp tier2-jit.h
 # Walker benchmark: 8M-iteration loop through the op walker vs scalar C++.
 bench: $(BENCH)
 
-$(BENCH): tier2-jit.cpp tier2-jit.h
+$(BENCH): tier2-jit.cpp tier2-jit.h $(HLE_OBJ)
 	mkdir -p $(BUILD_DIR)
-	$(CXX) -std=c++17 -O2 -DTIER2_JIT_BENCH_MAIN -Itcg/llvm -I. -o $@ tier2-jit.cpp \
+	$(CXX) -std=c++17 -O2 -DTIER2_JIT_BENCH_MAIN -Itcg/llvm -I. -Ilinux-user -I$(REPO_ROOT)/linux-user -o $@ tier2-jit.cpp $(HLE_OBJ) \
 	    $(LLVM_CXXFLAGS) \
 	    $(LLVM_LDFLAGS) \
 	    $(LLVM_LIBS) \

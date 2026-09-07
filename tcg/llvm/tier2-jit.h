@@ -34,10 +34,10 @@
  * addresses (epoch-1 objects jump to the recording boot's ASLR addresses
  * when loaded -- flaky SIGSEGV on warm runs).
  *
- * Epoch 3: self back-edges fuse into native loops with an interrupt
- * safepoint poll (new desc fields cpu_off/irq_off/has_safepoint).
+ * Epoch 4: Phase 5 goto_tb chain-stub linking with active TB tracking,
+ * Phase 4 vector SIMD opcodes (T2_VEC_*), and Phase 3 flat RAM base.
  */
-#define TIER2_CACHE_EPOCH 3
+#define TIER2_CACHE_EPOCH 4
 
 /*
  * Tier-2 side-exit protocol. Compiled traces never return raw TB
@@ -122,6 +122,20 @@ typedef enum Tier2Op {
     T2_BSWAP64 = 55,
     /* negsetcond: dst = -(c1 cond c2 ? 1 : 0). imm1=Tier2Cond. */
     T2_NEGSETCOND = 56,
+    /* Vector / SIMD opcodes (Phase 4: SSE/AVX -> ARM64 NEON) */
+    T2_VEC_ADD = 60,
+    T2_VEC_SUB = 61,
+    T2_VEC_MUL = 62,
+    T2_VEC_AND = 63,
+    T2_VEC_OR  = 64,
+    T2_VEC_XOR = 65,
+    T2_VEC_NOT = 66,
+    T2_VEC_SHL = 67,
+    T2_VEC_SHR = 68,
+    T2_VEC_SAR = 69,
+    T2_VEC_DUP = 70,
+    T2_VEC_LD  = 71,
+    T2_VEC_ST  = 72,
 } Tier2Op;
 
 /* Stable condition enum. Mapped from TCGCond by tier2.c at capture time. */
@@ -348,6 +362,9 @@ typedef struct Tier2TraceDesc {
     uint8_t _pad3[7];
     int64_t cpu_off;
     int64_t irq_off;
+    int64_t last_tb_off;
+    uint64_t ram_base;
+    uint64_t ram_size;
     char guest_arch[16];
     /* QEMU version string (upgrade safety: env layouts and helper
      * semantics follow the QEMU build). Empty disables caching. */

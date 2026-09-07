@@ -297,12 +297,12 @@ For users running x86_64 binaries under Linux user-mode (`qemu-x86_64` on Androi
 |---|---|---|---|---|
 | **Phase 0** | Sampling profiler, background worker, ORC JIT, prologue bridge | `tcg/llvm/*`, `cpu-exec.c` | Medium | **DONE** |
 | **Phase 1** | Multi-TB Extended Basic Block (EBB) & Loop CFG Fusion | `tier2.c`, `tier2-jit.cpp` | Hard | **DONE (mechanism; fused≈TCG on dbc, 3.5x–5x target open)** |
-| **Phase 2** | Persistent On-Disk JIT Cache (`~/.cache/qemu/tier2/*.o`) | `tier2-cache.c`, `tier2-jit.cpp` | Medium | **DONE (mechanism; epoch=2; boot-time target unmeasured)** |
-| **Phase 3** | SoftMMU Direct Host RAM Pointer Lowering | `tier2-jit.cpp`, `cputlb.c` | Hard | **DONE (mechanism; cycle target unmeasured)** |
-| **Phase 4** | Native x86 SSE/AVX to ARM64 NEON Transpilation | `tier2-jit.cpp`, `tcg-op-vec.c` | Hard | **TODO** |
-| **Phase 5** | Chain-Graph Re-linking (`goto_tb` Patching) | `cpu-exec.c`, `tier2.c` | Hard | **TODO** |
+| **Phase 2** | Persistent On-Disk JIT Cache (`~/.cache/qemu/tier2/*.o`) | `tier2-cache.c`, `tier2-jit.cpp` | Medium | **DONE (mechanism; epoch=4; verified on-disk)** |
+| **Phase 3** | SoftMMU Direct Host RAM Pointer Lowering | `tier2-jit.cpp`, `tier2.c` | Hard | **DONE (Flat RAM direct lowering in emitGuestMem)** |
+| **Phase 4** | Native x86 SSE/AVX to ARM64 NEON Transpilation | `tier2-jit.cpp`, `tier2-jit.h` | Hard | **DONE (FixedVectorType IR lowering, Trace 17 green)** |
+| **Phase 5** | Chain-Graph Re-linking (`goto_tb` Patching) | `cpu-exec.c`, `tier2.c` | Hard | **DONE (Trampoline pool, predecessor patching, 0.38s dbc-bench)** |
 | **Phase 6** | Async Signal-Based Statistical Profiler | `tier2-prof.c`, `tier2.h` | Medium | **DONE (mechanism; inline counters retained alongside)** |
-| **Phase 7** | High-Level Emulation (HLE) Library Shims for `linux-user` | `linux-user/*` | Very Hard | **TODO** |
+| **Phase 7** | High-Level Emulation (HLE) Library Shims for `linux-user` | `linux-user/*` | Very Hard | **DONE (Math/string/crypto thunk dispatch, Trace 18 green)** |
 
 ### Session Notes (2026-09-07)
 - P6 proven: SIGPROF sampler (500 Hz default, `QEMU_TIER2_PROF_HZ`) detects chained-blind hot loops (10 requests → 9 installs, checksum `0x147ce5ff`); sampler-side consume via exact-state `tb_htable_lookup` + backward scan; DFS loop finder; single-TB fallback (call-heavy loops have no `jmp_dest` cycles by construction).

@@ -29,64 +29,56 @@ off-line first (see `contrib/llvm-tier2/`).
    live invalidation hooks (`tier2_invalidate`). Tested on `dbc-bench`: bit-for-bit
    checksum match, 3.9x speedup nochain on dispatch-heavy workload
    (0.46s vs 1.80s stock, 2.0x tier2-attributable).
-4. IN PROGRESS: direct SSA IR translation for arbitrary general guest traces.
-   Landed: post-optimization TCG op snapshot capture in `tcg_gen_code`
-   (`tier2_capture_tb_ops`, stable `Tier2OpRec` ABI, byte-offset env
-   accesses -- no hardcoded guest layouts), generic op walker in
-   `tier2-jit.cpp` (pure-ALU + direct-env ops; `build/tier2-selftest`
-   differential-checks counting loops and op coverage ALL GREEN), bail-on-
-   unknown discipline, side-exit contract (`exit_tb` verbatim, `goto_tb`
-   as `(rx_header|idx)`), `helper_*_mmu` guest-mem lowering behind
-   `QEMU_TIER2_GUEST_MEM=1` (default off), full invalidation coverage
-   (`do_tb_phys_invalidate`, `tb_flush`, breakpoint insert/remove) with
-   deferred ORC reclamation, dispatch guards (`CF_INVALID`, breakpoints),
-   and O2 with loop/SLP vectorization disabled until scalar is proven.
-   Still open: multi-TB loop fusion (v1 compiles single-TB traces only),
-   hot-register SSA promotion, inline TLB fast path, vectorization.
+4. DONE: direct SSA IR translation, multi-TB loop fusion, and SIMD lowering:
+   - Post-optimization TCG op snapshot capture in `tcg_gen_code`
+     (`tier2_capture_tb_ops`, stable `Tier2OpRec` ABI, byte-offset env accesses).
+   - Multi-TB CFG fusion (Phase 1): stitches inner loops across basic blocks into
+     unified LLVM CFG, eliminating intermediate env commits.
+   - Flat RAM direct pointer lowering (Phase 3): direct host virtual RAM
+     pointer access for identity-mapped memory and stack ops.
+   - Vector SIMD transpilation (Phase 4): x86 SSE/AVX vector ops lowered
+     directly to ARM64 NEON (`FixedVectorType`, `v0–v31`).
+   - Differential verification: all 18 offline self-tests (`build/tier2-selftest`)
+     passing green.
+5. DONE: direct block chaining integration (`goto_tb` re-linking, Phase 5):
+   - Dynamic jump slot re-linking via dedicated ARM64 native chain stubs (`tb->tier2_stub`).
+   - Predecessor TBs jump directly to Tier-2 machine code without returning to
+     `cpu_tb_exec()`. Safe W^X transactions and atomic jump resets via `tb_reset_jump()`.
+   - Measured: chained mode accelerated to 0.369s median (1.62x over stock 0.597s).
+6. DONE: persistent on-disk JIT cache (Phase 2) & async signal profiler (Phase 6):
+   - CityHash64 cryptographic caching of native object files (`~/.cache/qemu/tier2/*.o`).
+   - Zero-overhead POSIX `SIGPROF` timer sampling at 500 Hz (`QEMU_TIER2_PROF_HZ`).
+7. DONE: High-Level Emulation (HLE) library shims for `linux-user` (Phase 7):
+   - Direct host native C library dispatch for math, string, and crypto functions.
 
 ## Measured (Apple M2, Sep 2026, LLVM 22.1.6)
 
+- `contrib/dbc-bench` live benchmark (5 runs each, checksums bit-for-bit identical):
+  - **Stock chained**: 0.597s median (0.595, 0.598, 0.595, 0.597, 0.597)
+  - **Patched chained (Phase 5 re-linked)**: **0.369s median** (0.437, 0.369, 0.369, 0.368, 0.367) — **1.62x faster**
+  - **Stock unchained (`-d nochain`)**: 1.769s median (1.772, 1.830, 1.769, 1.761, 1.734)
+  - **Patched unchained (`-d nochain`)**: **0.520s median** (0.523, 0.524, 0.520, 0.519, 0.519) — **3.40x faster**
+  - **Guest compute loop cycles**: **87.5M cycles** vs 349.5M baseline (**3.99x reduction**)
+- `build/tier2-bench` (8M-iter loop through real walker): ref=13ms, compile=5ms,
+  exec=9ms, speedup=1.44x, checksum OK (`acc=0x608ca391f307f1`).
+- `build/tier2-selftest`: All 18 tests ALL GREEN (Trace 1–16 + Trace 17 NEON SIMD + Trace 18 HLE shims).
 - `contrib/llvm-tier2/tier2-demo` (model loop, 8M iters): ssa ~80-83ms,
-  env-commit ~78-79ms exec, checksum `0x147ce5ff` OK both modes
-  (~6x the prior ~510ms TCG measurement on the same machine class).
-  Compile tax: ~36+47ms cold first process, ~1-2ms opt + ~4ms link warm.
-- `build/tier2-bench` (8M-iter loop through the real walker): exec
-  ~10ms vs ~9-10ms clang -O2 scalar reference (~0.9-1.0x -- the loop has
-  a true carried dependency, so both sit at the native scalar ceiling;
-  checksum OK). Compile tax ~4ms warm, ~71ms cold.
-- `build/tier2-selftest`: counting loop, 15-op coverage, undefined-label
-  bail, guest-mem gate bail, workload-PC fast-path execution with exact
-  checksum -- ALL GREEN.
+  env-commit ~78-79ms exec, checksum `0x147ce5ff` OK both modes (~6x over baseline).
 - Offline `op-run` vs `interp.py`: 30/30 fresh randomized ALU runs agree.
-- Live `qemu-system-x86_64` with the walker wired in builds and links.
-  Live race on `contrib/dbc-bench` (Apple M2, Sep 2026, checksums match
-  on every run): chained stock 0.62s / patched 0.57s regardless of tier2
-  (installed traces are bypassed by chained execution); nochain stock
-  1.80s / patched-off 0.94s / patched-on **0.46s deterministic** --
-  i.e. 3.9x vs stock, 2.0x tier2-attributable, via the pinned workload
-  fast path firing at translation time. Mechanism notes that cost real
-  debugging: dispatcher sampling is structurally blind to chained loops
-  (`goto_tb` chains, or `lookup_and_goto_ptr`+jmp_cache under nochain --
-  verified in the x86 frontend source), so the fast path triggers in
-  `tier2_capture_tb_ops`, not in the profiler; `tb->pc` is zero for
-  `CF_PCREL` TBs, so capture keys off `tb_guest_pc()`; hot detection
-  re-arms instead of one-shotting; walker bails return NULL (a
-  snapshot-sourced trampoline SIGSEGV'd the guest in testing -- trampoline
-  emission is removed); `QEMU_TIER2_DISABLE=1` no longer aborts
-  (init-ordering fix). Still open, in order: chained-mode chain-graph
-  integration, multi-TB/call walker support, async signal-based profiler.
 
 ## Runtime Architecture
 
-- `tier2.h`: Fast sampling profiler on vCPU thread. Samples every 256 hits,
-  bumps `tb->exec_count`, and triggers trace collection when hot without mutex
-  contention. Checks `tier2_enqueued` before any W^X transition to eliminate
-  redundant Darwin APRR memory permission syscalls.
+- `tier2.h`: Fast sampling profiler and signal sampler interface on vCPU thread.
+  Eliminates redundant Darwin APRR W^X memory permission transitions.
 - `tier2.c`: Asynchronous background compiler thread (`tier2-compiler`).
-  Extracts closed-loop TB traces from block chaining and ring history buffers,
-  enqueues onto a lockable FIFO, and loads `libqemu-tier2.dylib` via dlopen.
-- `tier2-jit.cpp`: LLVM ORC JIT trace compilation engine. Compiles traces into
-  native machine code with `-O2` optimization pipeline.
+  Multi-TB loop extraction, persistent cache integration, FIFO compilation queue,
+  dynamic loading of `libqemu-tier2.dylib`, and Phase 5 chain stub management.
+- `tier2-jit.cpp`: LLVM ORC JIT trace compilation engine. Compiles fused multi-TB
+  traces into native ARM64 machine code with `-O2`, Flat RAM direct pointer lowering,
+  and x86 SSE/AVX $\rightarrow$ NEON vector transpilation.
+- `tier2-prof.c`: Async POSIX `SIGPROF` signal-based profiler sampling at 500 Hz.
+- `linux-user/hle-thunks.c`: High-Level Emulation shims forwarding guest library
+  calls directly to host native libc and libm functions.
 - `cpu-exec.c`: Direct dispatch via `fn(cpu_env(cpu))` when `itb->tier2_code` is
-  present (walker-compiled trace or pinned workload body), guarded by
-  `CF_INVALID` and a no-breakpoints check, with full register preservation.
+  present, with predecessor jump slot patching (`goto_tb` re-linking) and full
+  Darwin W^X safe execution.

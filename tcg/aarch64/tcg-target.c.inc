@@ -3683,6 +3683,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
     /* TB epilogue */
     tb_ret_addr = tcg_splitwx_to_rx(s->code_ptr);
+    tcg_tb_ret_addr = tb_ret_addr;
     tcg_out_bti(s, BTI_J);
 
     /* Remove TCG locals stack space.  */

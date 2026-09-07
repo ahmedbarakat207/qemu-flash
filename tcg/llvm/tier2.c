@@ -25,6 +25,7 @@
 #include "exec/target_page.h"
 #include "exec/tlb-common.h"
 #include "hw/core/cpu.h"
+#include "qemu/cacheflush.h"
 
 #ifndef CONFIG_USER_ONLY
 /* Helper address for goto_ptr tail-call classification (same binary). */
@@ -382,6 +383,7 @@ bool tier2_has_prof_requests;
  */
 static bool tier2_sp_measured;
 static int64_t tier2_sp_cpu_off;
+static int64_t tier2_sp_last_tb_off;
 
 static void tier2_measure_safepoint(CPUState *cpu)
 {
@@ -394,6 +396,7 @@ static void tier2_measure_safepoint(CPUState *cpu)
         return;
     }
     tier2_sp_cpu_off = (int64_t)(uintptr_t)cpu - (int64_t)(uintptr_t)env;
+    tier2_sp_last_tb_off = (int64_t)offsetof(CPUState, last_tier2_tb);
     tier2_sp_measured = true;
 }
 
@@ -1476,6 +1479,81 @@ uint64_t tier2_snap_gen_current(void)
 }
 
 /*
+ * Phase 5: Executable Chain Stub Pool for direct goto_tb linking.
+ * Adapts TCG's in-register calling convention (env in x19, TCG stack active)
+ * to Tier-2's C AAPCS64 convention (env in x0), returning to tcg_tb_ret_addr.
+ */
+#define TIER2_STUB_SIZE 64
+static uint8_t *tier2_stub_pool = NULL;
+static size_t tier2_stub_pool_used = 0;
+static size_t tier2_stub_pool_cap = 0;
+static QemuMutex tier2_stub_lock;
+static bool tier2_stub_lock_inited = false;
+
+void *tier2_create_chain_stub(TranslationBlock *tb, void *native_code)
+{
+#if defined(__aarch64__)
+    if (!native_code || !tcg_tb_ret_addr) {
+        return NULL;
+    }
+    if (!tier2_stub_lock_inited) {
+        qemu_mutex_init(&tier2_stub_lock);
+        tier2_stub_lock_inited = true;
+    }
+    qemu_mutex_lock(&tier2_stub_lock);
+    if (!tier2_stub_pool || tier2_stub_pool_used + TIER2_STUB_SIZE > tier2_stub_pool_cap) {
+        size_t alloc_sz = 65536;
+        int flags = MAP_PRIVATE | MAP_ANON;
+#if defined(MAP_JIT)
+        flags |= MAP_JIT;
+#endif
+        void *p = mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE | PROT_EXEC, flags, -1, 0);
+        if (p == MAP_FAILED) {
+            qemu_mutex_unlock(&tier2_stub_lock);
+            return NULL;
+        }
+        tier2_stub_pool = (uint8_t *)p;
+        tier2_stub_pool_used = 0;
+        tier2_stub_pool_cap = alloc_sz;
+    }
+    uint32_t *stub = (uint32_t *)(tier2_stub_pool + tier2_stub_pool_used);
+    tier2_stub_pool_used += TIER2_STUB_SIZE;
+    qemu_mutex_unlock(&tier2_stub_lock);
+
+    qemu_thread_jit_write();
+    /*
+     * 0:  mov  x0, x19
+     * 4:  ldr  x16, [pc, #20] ; load native_code at offset 24
+     * 8:  blr  x16            ; call trace, returns exit_code in x0
+     * 12: ldr  x16, [pc, #20] ; load tcg_tb_ret_addr at offset 32
+     * 16: br   x16            ; return to TCG epilogue
+     * 20: nop                 ; 8-byte alignment padding
+     * 24: .quad native_code
+     * 32: .quad tcg_tb_ret_addr
+     */
+    stub[0] = 0xaa1303e0;
+    stub[1] = 0x580000b0;
+    stub[2] = 0xd63f0200;
+    stub[3] = 0x580000b0;
+    stub[4] = 0xd61f0200;
+    stub[5] = 0xd503201f;
+    *(uint64_t *)(stub + 6) = (uint64_t)(uintptr_t)native_code;
+    *(uint64_t *)(stub + 8) = (uint64_t)(uintptr_t)tcg_tb_ret_addr;
+
+    flush_idcache_range((uintptr_t)stub, (uintptr_t)stub, TIER2_STUB_SIZE);
+    /* Caller maintains write permissions for setting hdr->tier2_stub and re-linking */
+    return stub;
+#else
+    return NULL;
+#endif
+}
+
+void tier2_free_chain_stub(TranslationBlock *tb)
+{
+    tb->tier2_stub = NULL;
+}
+
+/*
  * Retire one installed header. Must hold snap_lock. Clears code (so no
  * new dispatches enter), detaches the exit-protocol record for RCU
  * reclamation (in-flight side exits may still read it -- they run under
@@ -1484,6 +1562,16 @@ uint64_t tier2_snap_gen_current(void)
  */
 static void tier2_retire_locked(TranslationBlock *hdr, void *fn)
 {
+    if (hdr->tier2_stub) {
+        TranslationBlock *pred;
+        int slot;
+        qemu_spin_lock(&hdr->jmp_lock);
+        TB_FOR_EACH_JMP(hdr, pred, slot) {
+            tb_reset_jump(pred, slot);
+        }
+        qemu_spin_unlock(&hdr->jmp_lock);
+        hdr->tier2_stub = NULL;
+    }
     if (tier2_jit_invalidate_fn) {
         tier2_jit_invalidate_fn(fn);
     }
@@ -1516,6 +1604,17 @@ static void tier2_publish_locked(TranslationBlock *hdr, void *fn,
         g_free_rcu(prev, rcu);
     }
     hdr->tier2_code = fn;
+    hdr->tier2_stub = tier2_create_chain_stub(hdr, fn);
+    if (hdr->tier2_stub) {
+        /* Phase 5: Re-link all predecessor jumps directly to the Tier-2 stub */
+        TranslationBlock *pred;
+        int slot;
+        qemu_spin_lock(&hdr->jmp_lock);
+        TB_FOR_EACH_JMP(hdr, pred, slot) {
+            tb_set_jmp_target(pred, slot, (uintptr_t)hdr->tier2_stub);
+        }
+        qemu_spin_unlock(&hdr->jmp_lock);
+    }
 }
 
 /* Drop Tier-2 compiled code when a TB is invalidated. Must be called with
@@ -1527,6 +1626,7 @@ void tier2_invalidate(TranslationBlock *tb)
         return;
     }
 
+    qemu_thread_jit_write();
     qemu_mutex_lock(&tier2_snap_lock);
     /*
      * Conservative v1: any invalidation drops ALL snapshots and ALL
@@ -1710,6 +1810,14 @@ static void tier2_compile_trace(const Tier2Trace *trace)
         desc->has_safepoint = tier2_sp_measured;
         desc->cpu_off = tier2_sp_cpu_off;
         desc->irq_off = (int64_t)offsetof(CPUState, interrupt_request);
+        desc->last_tb_off = tier2_sp_last_tb_off;
+#ifndef CONFIG_USER_ONLY
+        desc->ram_base = 0;
+        desc->ram_size = 0;
+#else
+        desc->ram_base = (uint64_t)(uintptr_t)guest_base;
+        desc->ram_size = ~0ULL;
+#endif
         desc->trace_id = 0;
         desc->workload_pc = tier2_workload_pc;
         tier2_fill_tlb_layout(&desc->tlb);
@@ -1894,7 +2002,7 @@ static void tier2_compile_trace(const Tier2Trace *trace)
                 valid = false;
                 break;
             }
-            rec->rx[i] = snap->rx_tb;
+            rec->rx[i] = (void *)snap->rx_tb;
         }
         if (valid) {
             tier2_publish_locked(hdr, native_code, rec);
@@ -1925,6 +2033,7 @@ static void tier2_compile_trace(const Tier2Trace *trace)
 /* Background compiler worker thread */
 static void *tier2_worker_thread(void *arg)
 {
+    rcu_register_thread();
     while (!tier2_stopping) {
         qemu_mutex_lock(&tier2_queue_lock);
         while (!tier2_work_queue && !tier2_stopping) {
@@ -1966,6 +2075,8 @@ void tier2_init(void)
     qemu_mutex_init(&tier2_queue_lock);
     qemu_cond_init(&tier2_cond);
     qemu_mutex_init(&tier2_snap_lock);
+    qemu_mutex_init(&tier2_stub_lock);
+    tier2_stub_lock_inited = true;
     tier2_snaps = g_hash_table_new_full(NULL, NULL, NULL, g_free);
     tier2_installed = g_hash_table_new(NULL, NULL);
     tier2_helper_names = g_hash_table_new(NULL, NULL);

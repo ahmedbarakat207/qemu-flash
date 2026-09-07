@@ -500,7 +500,9 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
         if (unlikely(idx == 2)) {
             idx = 0; /* unreachable by construction; stay well-formed */
         }
-        Tier2Installed *rec = qatomic_rcu_read(&itb->tier2_rec);
+        TranslationBlock *active_tb = cpu->last_tier2_tb ? cpu->last_tier2_tb : itb;
+        cpu->last_tier2_tb = NULL;
+        Tier2Installed *rec = qatomic_rcu_read(&active_tb->tier2_rec);
         if (rec != NULL && k < rec->num_members &&
             rec->gen == tier2_snap_gen_current()) {
             void *rx = rec->rx[k];
@@ -727,8 +729,11 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
         goto out_unlock_next;
     }
 
-    /* patch the native jump address */
-    tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr);
+    /* patch the native jump address (Phase 5: prefer Tier-2 chain stub) */
+    uintptr_t target = tb_next->tier2_stub ?
+                       (uintptr_t)tb_next->tier2_stub :
+                       (uintptr_t)tb_next->tc.ptr;
+    tb_set_jmp_target(tb, n, target);
 
     /* add in TB jmp list */
     tb->jmp_list_next[n] = tb_next->jmp_list_head;

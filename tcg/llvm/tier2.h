@@ -135,6 +135,12 @@ static inline void *tier2_lookup(const TranslationBlock *tb)
 }
 
 /*
+ * Phase 5: Chain-stub helpers for direct goto_tb linking.
+ */
+void *tier2_create_chain_stub(TranslationBlock *tb, void *native_code);
+void tier2_free_chain_stub(TranslationBlock *tb);
+
+/*
  * Drop all tier-2 code derived from @tb. Called from existing TB
  * invalidation paths. Also drops any installed trace that merely
  * CONTAINS @tb (a stale loop body is a correctness bug, not a perf bug).

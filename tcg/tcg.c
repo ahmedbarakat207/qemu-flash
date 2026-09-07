@@ -245,6 +245,7 @@ unsigned int tcg_cur_ctxs;
 unsigned int tcg_max_ctxs;
 TCGv_env tcg_env;
 const void *tcg_code_gen_epilogue;
+const void *tcg_tb_ret_addr;
 ptrdiff_t tcg_splitwx_diff;
 
 #ifndef CONFIG_TCG_INTERPRETER
