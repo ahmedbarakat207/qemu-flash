@@ -471,12 +471,14 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
      * breakpoint-page/single-step checks, so any breakpoint forces TCG).
      */
     void *tier2_fn = tier2_lookup(itb);
+    bool is_tier2 = false;
     if (unlikely(tier2_fn != NULL) && !(tb_cflags(itb) & CF_INVALID) &&
         likely(QTAILQ_EMPTY(&cpu->breakpoints))) {
         typedef uintptr_t (*Tier2Func)(CPUArchState *env);
         if (unlikely(tier2_counting)) {
             tier2_note_dispatch(true);
         }
+        is_tier2 = true;
         ret = ((Tier2Func)tier2_fn)(cpu_env(cpu));
     } else {
         if (unlikely(tier2_counting)) {
@@ -487,32 +489,18 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
     if (unlikely((int64_t)ret < 0)) {
+        is_tier2 = true;
         /*
          * Tier-2 side-exit protocol (see tcg/llvm/tier2.h): compiled code
          * returns small (tb-index, exit-idx) codes instead of baked TB
-         * pointers, so cached native objects stay relocatable. Resolve
-         * against the installed record's CURRENT rx values; on any doubt
-         * (no record, stale generation, bad index) fall back to a clean
-         * dispatcher lookup, exactly like a goto_ptr miss.
+         * pointers, so cached native objects stay relocatable. Side exits
+         * return NULL to dispatch cleanly into the next TB.
          */
         unsigned idx = ret & TB_EXIT_MASK;
-        unsigned k = (ret >> TIER2_EXIT_TB_SHIFT) & 0xF;
         if (unlikely(idx == 2)) {
             idx = 0; /* unreachable by construction; stay well-formed */
         }
-        TranslationBlock *active_tb = cpu->last_tier2_tb ? cpu->last_tier2_tb : itb;
-        cpu->last_tier2_tb = NULL;
-        Tier2Installed *rec = qatomic_rcu_read(&active_tb->tier2_rec);
-        if (rec != NULL && k < rec->num_members &&
-            rec->gen == tier2_snap_gen_current()) {
-            void *rx = rec->rx[k];
-            if (rx != NULL) {
-                last_tb = tcg_splitwx_to_rw(rx);
-                *tb_exit = idx;
-                goto tier2_exit_done;
-            }
-        }
-        last_tb = NULL;
+        last_tb = itb;
         *tb_exit = idx;
         goto tier2_exit_done;
     }
@@ -524,13 +512,14 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
      * If we insist on touching both the RX and the RW pages, we
      * double the host TLB pressure.
      */
-    last_tb = tcg_splitwx_to_rw((void *)(ret & ~TB_EXIT_MASK));
+    uintptr_t ret_tb = ret & ~TB_EXIT_MASK;
+    last_tb = ret_tb ? tcg_splitwx_to_rw((void *)ret_tb) : NULL;
     *tb_exit = ret & TB_EXIT_MASK;
 
 tier2_exit_done:
     trace_exec_tb_exit(last_tb, *tb_exit);
 
-    if (*tb_exit > TB_EXIT_IDX1) {
+    if (!is_tier2 && *tb_exit > TB_EXIT_IDX1 && last_tb != NULL) {
         /* We didn't start executing this TB (eg because the instruction
          * counter hit zero); we must restore the guest PC to the address
          * of the start of the TB.
@@ -565,7 +554,7 @@ tier2_exit_done:
         cpu_loop_exit(cpu);
     }
 
-    return last_tb;
+    return is_tier2 ? NULL : last_tb;
 }
 
 
@@ -697,6 +686,9 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
     uintptr_t old;
 
     assert(n < ARRAY_SIZE(tb->jmp_list_next));
+    if (tb->tier2_code != NULL) {
+        return;
+    }
 
     /*
      * Fast path: the slot is already claimed, so no new link can be

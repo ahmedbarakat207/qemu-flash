@@ -330,6 +330,12 @@ static const char *t2opname(unsigned op)
     case T2_BSWAP32: return "bswap32";
     case T2_BSWAP64: return "bswap64";
     case T2_NEGSETCOND: return "negsetcond";
+    case T2_MULSH: return "mulsh";
+    case T2_MULUH: return "muluh";
+    case T2_ANDC: return "andc";
+    case T2_ORC: return "orc";
+    case T2_CLZ: return "clz";
+    case T2_CTZ: return "ctz";
     default: return "unsupported";
     }
 }
@@ -378,6 +384,7 @@ struct WalkState {
                         * skipped until the next SETLABEL (unreachable in
                         * TCG too, so skipping is faithful) */
     bool debug = false;
+    Value *loop_cnt = nullptr;
 };
 
 static const Tier2TBRec *curRec(const WalkState &S)
@@ -1463,6 +1470,70 @@ static bool emitTB(IRBuilder<> &B, WalkState &S, uint32_t tb)
                                                   B.CreateZExt(c, S.I64)));
             break;
         }
+        case T2_ANDC: {
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            Value *v1 = U(op.src1);
+            Value *v2 = U(op.src2);
+            if (!ok) { return false; }
+            defTemp(B, S, tb, op.dst, B.CreateAnd(v1, B.CreateNot(v2)));
+            break;
+        }
+        case T2_ORC: {
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            Value *v1 = U(op.src1);
+            Value *v2 = U(op.src2);
+            if (!ok) { return false; }
+            defTemp(B, S, tb, op.dst, B.CreateOr(v1, B.CreateNot(v2)));
+            break;
+        }
+        case T2_MULSH:
+        case T2_MULUH: {
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            Value *v1 = U(op.src1);
+            Value *v2 = U(op.src2);
+            if (!ok) { return false; }
+            bool is_signed = (op.op == T2_MULSH);
+            if (b == 64) {
+                Type *i128Ty = Type::getInt128Ty(C);
+                Value *ext1 = is_signed ? B.CreateSExt(v1, i128Ty) : B.CreateZExt(v1, i128Ty);
+                Value *ext2 = is_signed ? B.CreateSExt(v2, i128Ty) : B.CreateZExt(v2, i128Ty);
+                Value *prod = B.CreateMul(ext1, ext2);
+                Value *hi128 = is_signed ? B.CreateAShr(prod, 64) : B.CreateLShr(prod, 64);
+                Value *hi = B.CreateTrunc(hi128, S.I64);
+                defTemp(B, S, tb, op.dst, hi);
+            } else {
+                Value *v1_32 = B.CreateTrunc(v1, Type::getInt32Ty(C));
+                Value *v2_32 = B.CreateTrunc(v2, Type::getInt32Ty(C));
+                Value *ext1 = is_signed ? B.CreateSExt(v1_32, S.I64) : B.CreateZExt(v1_32, S.I64);
+                Value *ext2 = is_signed ? B.CreateSExt(v2_32, S.I64) : B.CreateZExt(v2_32, S.I64);
+                Value *prod = B.CreateMul(ext1, ext2);
+                Value *hi64 = is_signed ? B.CreateAShr(prod, 32) : B.CreateLShr(prod, 32);
+                Value *hi = B.CreateZExt(B.CreateTrunc(hi64, Type::getInt32Ty(C)), S.I64);
+                defTemp(B, S, tb, op.dst, hi);
+            }
+            break;
+        }
+        case T2_CLZ:
+        case T2_CTZ: {
+            if (!tempOk(S, tb, op.dst)) { return false; }
+            Value *val = U(op.src1);
+            Value *def_val = U(op.src2);
+            if (!ok) { return false; }
+            bool is_clz = (op.op == T2_CLZ);
+            Type *intTy = (b == 32) ? (Type *)Type::getInt32Ty(C) : (Type *)S.I64;
+            Value *inp = (b == 32) ? B.CreateTrunc(val, Type::getInt32Ty(C)) : val;
+            Intrinsic::ID iid = is_clz ? Intrinsic::ctlz : Intrinsic::cttz;
+            Value *cnt = B.CreateCall(Intrinsic::getOrInsertDeclaration(S.M, iid, {intTy}),
+                                      {inp, B.getInt1(false)});
+            Value *is_zero = B.CreateICmpEQ(inp, ConstantInt::get(intTy, 0));
+            Value *def_trunc = (b == 32) ? B.CreateTrunc(def_val, Type::getInt32Ty(C)) : def_val;
+            Value *res = B.CreateSelect(is_zero, def_trunc, cnt);
+            if (b == 32) {
+                res = B.CreateZExt(res, S.I64);
+            }
+            defTemp(B, S, tb, op.dst, res);
+            break;
+        }
         /* Phase 4: Vector / SIMD Transpilation (x86 SSE/AVX -> ARM64 NEON) */
         case T2_VEC_ADD:
         case T2_VEC_SUB:
@@ -1611,8 +1682,15 @@ static bool emitTB(IRBuilder<> &B, WalkState &S, uint32_t tb)
                                         B.getInt64(S.trace->irq_off)),
                             PointerType::get(C, 0));
                         Value *pend = B.CreateLoad(Type::getInt32Ty(C), irqp);
-                        B.CreateCondBr(
-                            B.CreateICmpNE(pend, B.getInt32(0)), irq, loop);
+                        Value *has_irq = B.CreateICmpNE(pend, B.getInt32(0));
+
+                        Value *cur_cnt = B.CreateLoad(Type::getInt32Ty(C), S.loop_cnt);
+                        Value *next_cnt = B.CreateSub(cur_cnt, B.getInt32(1));
+                        B.CreateStore(next_cnt, S.loop_cnt);
+                        Value *expired = B.CreateICmpSLE(next_cnt, B.getInt32(0));
+
+                        Value *should_exit = B.CreateOr(has_irq, expired);
+                        B.CreateCondBr(should_exit, irq, loop);
                         B.SetInsertPoint(irq);
                         B.CreateRet(B.getInt64(TIER2_EXIT_PROTOCOL |
                                                ((uint64_t)tb << 2) |
@@ -1658,15 +1736,18 @@ static bool emitTB(IRBuilder<> &B, WalkState &S, uint32_t tb)
             if (cls == T2_GOTO_LOOKUP_CALL && g_prologue_fn != nullptr) {
                 /*
                  * Address came from helper_lookup_tb_ptr: tail-call the
-                 * TCG prologue with its result and return that. Same two
-                 * functions TCG invokes, same order, minus one dispatcher
-                 * round trip. Env was committed for the lookup call by
-                 * the T2_CALL emission, and nothing runs after us.
+                 * TCG prologue with its result and return that. If the lookup
+                 * returned NULL/epilogue, cleanly return 0 to the dispatcher.
                  */
                 Value *code = U(op.src1);
                 if (!ok) {
                     return false;
                 }
+                BasicBlock *call_prologue = BasicBlock::Create(C, "goto_prologue", S.F);
+                BasicBlock *ret_zero = BasicBlock::Create(C, "goto_zero", S.F);
+                B.CreateCondBr(B.CreateICmpEQ(code, B.getInt64(0)), ret_zero, call_prologue);
+
+                B.SetInsertPoint(call_prologue);
                 FunctionType *PT = FunctionType::get(
                     S.I64, {PointerType::get(C, 0), PointerType::get(C, 0)},
                     false);
@@ -1676,6 +1757,9 @@ static bool emitTB(IRBuilder<> &B, WalkState &S, uint32_t tb)
                     PT, prologue,
                     {S.envI8, B.CreateIntToPtr(code, PointerType::get(C, 0))});
                 B.CreateRet(r);
+
+                B.SetInsertPoint(ret_zero);
+                B.CreateRet(B.getInt64(0));
                 S.dead = true;
                 break;
             }
@@ -1754,6 +1838,8 @@ static bool tryCompileOps(Module *M, LLVMContext &C, Function *F,
     WalkState S{C, M, F, envI8, trace};
     S.I64 = Type::getInt64Ty(C);
     S.debug = getenv("QEMU_TIER2_DEBUG") != nullptr;
+    S.loop_cnt = B.CreateAlloca(Type::getInt32Ty(C), nullptr, "self_loop_cnt");
+    B.CreateStore(B.getInt32(4096), S.loop_cnt);
 
     /* PC -> trace index for static goto_ptr resolution (first wins;
      * duplicated PCs across TBs stay dynamic). */
@@ -1884,14 +1970,6 @@ static bool tryCompileOps(Module *M, LLVMContext &C, Function *F,
         }
     }
 
-    /* Phase 5: Record active TB pointer in CPUState for exit resolution */
-    if (trace->has_safepoint && trace->last_tb_off != 0 && trace->rx_header != nullptr) {
-        Value *cpu = B.CreateGEP(B.getInt8Ty(), S.envI8, B.getInt64(trace->cpu_off));
-        Value *last_tb_ptr = B.CreateBitCast(
-            B.CreateGEP(B.getInt8Ty(), cpu, B.getInt64(trace->last_tb_off)),
-            PointerType::get(C, 0));
-        B.CreateStore(B.getInt64((uint64_t)(uintptr_t)trace->rx_header), last_tb_ptr);
-    }
 
     B.CreateBr(S.entries[trace->header_idx]);
 
@@ -3844,7 +3922,80 @@ extern "C" bool tier2_jit_selftest(void)
         fprintf(stderr, "[tier2-selftest] trace18 sha256 thunk result mismatch\n");
         return false;
     }
-    printf("[tier2-selftest] trace18 HLE library shims OK\n");
+    /* -------------------------------------------------------------- */
+    /* Trace 19: High multiply & bitwise ops (mulsh, muluh, andc,     */
+    /* orc, clz, ctz)                                                 */
+    /* -------------------------------------------------------------- */
+    auto t19 = std::make_unique<Tier2TraceDesc>();
+    memset(t19.get(), 0, sizeof(*t19));
+    t19->num_tbs = 1;
+    t19->has_ops = true;
+    t19->trace_id = 19;
+    t19->header_pc = 0x13000;
+    t19->rx_header = (const void *)0x13000;
+    for (int i = 0; i < TIER2_MAX_TRACE_TBS; i++) {
+        t19->next[i] = -1;
+        t19->next_slot[i] = -1;
+    }
+    t19->header_idx = 0;
+    Tier2TBRec &r19 = t19->recs[0];
+    r19.pc = 0x13000;
+    r19.rx_tb = (const void *)0x13000;
+    r19.num_temps = 10;
+    for (int i = 0; i < 10; i++) {
+        mkTemp(r19, i, false, false, 64, -1, 0);
+    }
+    mkTemp(r19, 8, true, false, 64, -1, 64); /* def_val = 64 */
+    std::vector<Tier2OpRec> o19;
+    o19.push_back(mkOp(T2_LD64, 64, 0, -1, -1, -1, -1, 0, 0));   /* a = env[0] */
+    o19.push_back(mkOp(T2_LD64, 64, 1, -1, -1, -1, -1, 8, 0));   /* b = env[8] */
+    o19.push_back(mkOp(T2_ANDC, 64, 2, 0, 1, -1, -1, 0, 0));     /* andc */
+    o19.push_back(mkOp(T2_ORC, 64, 3, 0, 1, -1, -1, 0, 0));      /* orc */
+    o19.push_back(mkOp(T2_MULSH, 64, 4, 0, 1, -1, -1, 0, 0));    /* mulsh */
+    o19.push_back(mkOp(T2_MULUH, 64, 5, 0, 1, -1, -1, 0, 0));    /* muluh */
+    o19.push_back(mkOp(T2_CLZ, 64, 6, 0, 8, -1, -1, 0, 0));      /* clz */
+    o19.push_back(mkOp(T2_CTZ, 64, 7, 0, 8, -1, -1, 0, 0));      /* ctz */
+    o19.push_back(mkOp(T2_ST64, 64, -1, 2, -1, -1, -1, 16, 0));
+    o19.push_back(mkOp(T2_ST64, 64, -1, 3, -1, -1, -1, 24, 0));
+    o19.push_back(mkOp(T2_ST64, 64, -1, 4, -1, -1, -1, 32, 0));
+    o19.push_back(mkOp(T2_ST64, 64, -1, 5, -1, -1, -1, 40, 0));
+    o19.push_back(mkOp(T2_ST64, 64, -1, 6, -1, -1, -1, 48, 0));
+    o19.push_back(mkOp(T2_ST64, 64, -1, 7, -1, -1, -1, 56, 0));
+    o19.push_back(mkOp(T2_EXIT_TB, 0, -1, -1, -1, -1, -1, 0x13000, 0));
+    r19.num_ops = (uint32_t)o19.size();
+    for (size_t i = 0; i < o19.size(); i++) {
+        r19.ops[i] = o19[i];
+    }
+    static uint64_t op_env[8];
+    memset(op_env, 0, sizeof(op_env));
+    uint64_t inA = 0x100000002ULL;
+    uint64_t inB = 0x300000004ULL;
+    op_env[0] = inA;
+    op_env[1] = inB;
+    void *fn19 = tier2_jit_compile_trace(t19.get());
+    if (!fn19) {
+        fprintf(stderr, "[tier2-selftest] trace19 failed to compile\n");
+        return false;
+    }
+    if (((FnT)fn19)(op_env) != (TIER2_EXIT_PROTOCOL | 0)) {
+        fprintf(stderr, "[tier2-selftest] trace19 exit protocol mismatch\n");
+        return false;
+    }
+    uint64_t exp_andc = inA & ~inB;
+    uint64_t exp_orc = inA | ~inB;
+    unsigned __int128 p_u = (unsigned __int128)inA * (unsigned __int128)inB;
+    uint64_t exp_muluh = (uint64_t)(p_u >> 64);
+    __int128 p_s = (__int128)(int64_t)inA * (__int128)(int64_t)inB;
+    uint64_t exp_mulsh = (uint64_t)(p_s >> 64);
+    uint64_t exp_clz = (uint64_t)__builtin_clzll(inA);
+    uint64_t exp_ctz = (uint64_t)__builtin_ctzll(inA);
+    if (op_env[2] != exp_andc || op_env[3] != exp_orc ||
+        op_env[4] != exp_mulsh || op_env[5] != exp_muluh ||
+        op_env[6] != exp_clz || op_env[7] != exp_ctz) {
+        fprintf(stderr, "[tier2-selftest] trace19 arithmetic op mismatch\n");
+        return false;
+    }
+    printf("[tier2-selftest] trace19 mulsh/muluh/andc/orc/clz/ctz OK\n");
 
     printf("[tier2-selftest] ALL GREEN\n");
     return true;

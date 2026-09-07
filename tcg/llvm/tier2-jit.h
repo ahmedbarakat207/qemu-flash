@@ -36,8 +36,15 @@
  *
  * Epoch 4: Phase 5 goto_tb chain-stub linking with active TB tracking,
  * Phase 4 vector SIMD opcodes (T2_VEC_*), and Phase 3 flat RAM base.
+ *
+ * Epoch 5: Phase 5 bounded self-loop safepoint and split-WX RW/RX active TB.
+ *
+ * Epoch 6: Eliminate baked host pointers for active TB tracking to keep
+ * cached traces completely relocatable across ASLR runs.
+ *
+ * Epoch 7: Add bitwise and arithmetic opcodes (mulsh, muluh, andc, orc, clz, ctz).
  */
-#define TIER2_CACHE_EPOCH 4
+#define TIER2_CACHE_EPOCH 7
 
 /*
  * Tier-2 side-exit protocol. Compiled traces never return raw TB
@@ -136,6 +143,13 @@ typedef enum Tier2Op {
     T2_VEC_DUP = 70,
     T2_VEC_LD  = 71,
     T2_VEC_ST  = 72,
+    /* High multiply and bitwise operations */
+    T2_MULSH   = 75,
+    T2_MULUH   = 76,
+    T2_ANDC    = 77,
+    T2_ORC     = 78,
+    T2_CLZ     = 79,
+    T2_CTZ     = 80,
 } Tier2Op;
 
 /* Stable condition enum. Mapped from TCGCond by tier2.c at capture time. */

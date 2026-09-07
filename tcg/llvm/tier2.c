@@ -1039,6 +1039,42 @@ static bool tier2_capture_op(TCGContext *s, TCGOp *op, Tier2TBRec *rec,
             tier2_emit(rec, T2_NEGSETCOND, bits, d, a, b, -1, -1, c, 0);
         }
         return true;
+    case INDEX_op_andc:
+    case INDEX_op_orc: {
+        d = tier2_arg_temp(s, op->args[0]);
+        a = tier2_arg_temp(s, op->args[1]);
+        b = tier2_arg_temp(s, op->args[2]);
+        if (d < 0 || a < 0 || b < 0) {
+            return false;
+        }
+        tier2_emit(rec, op->opc == INDEX_op_andc ? T2_ANDC : T2_ORC,
+                   bits, d, a, b, -1, -1, 0, 0);
+        return true;
+    }
+    case INDEX_op_mulsh:
+    case INDEX_op_muluh: {
+        d = tier2_arg_temp(s, op->args[0]);
+        a = tier2_arg_temp(s, op->args[1]);
+        b = tier2_arg_temp(s, op->args[2]);
+        if (d < 0 || a < 0 || b < 0) {
+            return false;
+        }
+        tier2_emit(rec, op->opc == INDEX_op_mulsh ? T2_MULSH : T2_MULUH,
+                   bits, d, a, b, -1, -1, 0, 0);
+        return true;
+    }
+    case INDEX_op_clz:
+    case INDEX_op_ctz: {
+        d = tier2_arg_temp(s, op->args[0]);
+        a = tier2_arg_temp(s, op->args[1]);
+        b = tier2_arg_temp(s, op->args[2]);
+        if (d < 0 || a < 0 || b < 0) {
+            return false;
+        }
+        tier2_emit(rec, op->opc == INDEX_op_clz ? T2_CLZ : T2_CTZ,
+                   bits, d, a, b, -1, -1, 0, 0);
+        return true;
+    }
     case INDEX_op_bswap16:
     case INDEX_op_bswap32:
     case INDEX_op_bswap64: {
@@ -1562,16 +1598,7 @@ void tier2_free_chain_stub(TranslationBlock *tb)
  */
 static void tier2_retire_locked(TranslationBlock *hdr, void *fn)
 {
-    if (hdr->tier2_stub) {
-        TranslationBlock *pred;
-        int slot;
-        qemu_spin_lock(&hdr->jmp_lock);
-        TB_FOR_EACH_JMP(hdr, pred, slot) {
-            tb_reset_jump(pred, slot);
-        }
-        qemu_spin_unlock(&hdr->jmp_lock);
-        hdr->tier2_stub = NULL;
-    }
+    hdr->tier2_stub = NULL;
     if (tier2_jit_invalidate_fn) {
         tier2_jit_invalidate_fn(fn);
     }
@@ -1605,16 +1632,6 @@ static void tier2_publish_locked(TranslationBlock *hdr, void *fn,
     }
     hdr->tier2_code = fn;
     hdr->tier2_stub = tier2_create_chain_stub(hdr, fn);
-    if (hdr->tier2_stub) {
-        /* Phase 5: Re-link all predecessor jumps directly to the Tier-2 stub */
-        TranslationBlock *pred;
-        int slot;
-        qemu_spin_lock(&hdr->jmp_lock);
-        TB_FOR_EACH_JMP(hdr, pred, slot) {
-            tb_set_jmp_target(pred, slot, (uintptr_t)hdr->tier2_stub);
-        }
-        qemu_spin_unlock(&hdr->jmp_lock);
-    }
 }
 
 /* Drop Tier-2 compiled code when a TB is invalidated. Must be called with
@@ -1628,31 +1645,40 @@ void tier2_invalidate(TranslationBlock *tb)
 
     qemu_thread_jit_write();
     qemu_mutex_lock(&tier2_snap_lock);
+
     /*
-     * Conservative v1: any invalidation drops ALL snapshots and ALL
-     * installed traces, not just ones rooted at @tb. A compiled loop body
-     * spanning several TBs goes stale when ANY member TB dies, and we do
-     * not track exact trace membership yet. This is cheap: snapshots are
-     * rebuilt automatically at the next translation, exec_count is
-     * retained so re-compilation re-triggers quickly, and correctness
-     * (never execute stale code) dominates. tier2_snap_gen is bumped so
-     * a background compile in flight discards its result at install.
+     * Targeted invalidation: only remove the snapshot for @tb, and retire
+     * installed traces that actually contain @tb (as header or trace member).
+     * Do NOT drop all snapshots or bump tier2_snap_gen across the whole VM;
+     * doing so thrashes compilation during OS boots and guest code churn.
      */
     if (tier2_snaps) {
-        g_hash_table_remove_all(tier2_snaps);
-        tier2_snap_count = 0;
+        g_hash_table_remove(tier2_snaps, tb);
+        tier2_snap_count = (uint32_t)g_hash_table_size(tier2_snaps);
     }
     if (tier2_installed && g_hash_table_size(tier2_installed) > 0) {
+        void *rx_tb = (void *)tcg_splitwx_to_rx(tb);
         GHashTableIter it;
         gpointer k, v;
         g_hash_table_iter_init(&it, tier2_installed);
         while (g_hash_table_iter_next(&it, &k, &v)) {
             TranslationBlock *hdr = (TranslationBlock *)k;
-            tier2_retire_locked(hdr, v);
-            g_hash_table_iter_remove(&it);
+            bool matches = (hdr == tb);
+            if (!matches && hdr->tier2_rec) {
+                Tier2Installed *rec = hdr->tier2_rec;
+                for (uint32_t i = 0; i < rec->num_members; i++) {
+                    if (rec->rx[i] == rx_tb) {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+            if (matches) {
+                tier2_retire_locked(hdr, v);
+                g_hash_table_iter_remove(&it);
+            }
         }
     }
-    tier2_snap_gen++;
     qemu_mutex_unlock(&tier2_snap_lock);
 
     /* tb is the RW view (invalidation paths); write it directly. */
@@ -2118,10 +2144,24 @@ void tier2_init(void)
     }
 
 #ifndef _WIN32
+#if defined(__APPLE__)
+    /*
+     * On Darwin/Apple Silicon, asynchronous SIGPROF delivery to threads
+     * running in MAP_JIT code violates APRR / libsystem stack checks,
+     * causing __stack_chk_fail and SIGSEGV. Default to off on Darwin;
+     * allow opt-in via QEMU_TIER2_PROF=1.
+     */
+    tier2_prof_disabled = true;
+    const char *env_prof = getenv("QEMU_TIER2_PROF");
+    if (env_prof && strcmp(env_prof, "1") == 0) {
+        tier2_prof_disabled = false;
+    }
+#else
     const char *env_prof = getenv("QEMU_TIER2_PROF");
     if (env_prof && strcmp(env_prof, "0") == 0) {
         tier2_prof_disabled = true;
     }
+#endif
     const char *env_hz = getenv("QEMU_TIER2_PROF_HZ");
     if (env_hz) {
         unsigned long v = strtoul(env_hz, NULL, 0);
