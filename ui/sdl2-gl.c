@@ -117,10 +117,10 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
 
     qemu_console_hw_update(dcl->con);
     if (scon->updates && scon->real_window) {
-        scon->updates = 0;
         sdl2_gl_render_surface(scon);
     }
     sdl2_poll_events(scon);
+    scon->updates = 0;
 }
 
 void sdl2_gl_redraw(struct sdl2_console *scon)

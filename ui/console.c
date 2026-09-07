@@ -118,8 +118,19 @@ static void gui_update(void *opaque)
         ds->update_interval = interval;
         trace_console_refresh(interval);
     }
-    ds->last_update = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-    timer_mod(ds->gui_timer, ds->last_update + interval);
+    uint64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    uint64_t next_time;
+
+    if (ds->last_update == 0 || now > ds->last_update + interval * 2) {
+        next_time = now + interval;
+    } else {
+        next_time = ds->last_update + interval;
+        if (next_time <= now) {
+            next_time = now + 1;
+        }
+    }
+    ds->last_update = next_time;
+    timer_mod(ds->gui_timer, next_time);
 }
 
 static void gui_setup_refresh(DisplayState *ds)

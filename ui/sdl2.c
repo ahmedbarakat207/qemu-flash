@@ -59,7 +59,7 @@ static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 
-#define SDL2_REFRESH_INTERVAL_BUSY 10
+#define SDL2_REFRESH_INTERVAL_BUSY 16
 #define SDL2_MAX_IDLE_COUNT (2 * GUI_REFRESH_INTERVAL_DEFAULT \
                              / SDL2_REFRESH_INTERVAL_BUSY + 1)
 
@@ -129,7 +129,12 @@ void sdl2_window_create(struct sdl2_console *scon)
 #endif
     } else {
         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
-        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
+        SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
+        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1,
+                                                 SDL_RENDERER_ACCELERATED);
+        if (!scon->real_renderer) {
+            scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
+        }
     }
 
     sdl_update_caption(scon);
@@ -741,6 +746,10 @@ void sdl2_poll_events(struct sdl2_console *scon)
         default:
             break;
         }
+    }
+
+    if (scon->updates) {
+        idle = 0;
     }
 
     if (idle) {

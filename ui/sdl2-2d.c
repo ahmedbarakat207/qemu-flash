@@ -51,9 +51,7 @@ void sdl2_2d_update(DisplayChangeListener *dcl,
     SDL_UpdateTexture(scon->texture, &rect,
                       surface_data(surf) + surface_data_offset,
                       surface_stride(surf));
-    SDL_RenderClear(scon->real_renderer);
-    SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
-    SDL_RenderPresent(scon->real_renderer);
+    scon->updates++;
 }
 
 void sdl2_2d_switch(DisplayChangeListener *dcl,
@@ -130,7 +128,13 @@ void sdl2_2d_refresh(DisplayChangeListener *dcl)
 
     assert(!scon->opengl);
     qemu_console_hw_update(dcl->con);
+    if (scon->updates && scon->real_renderer) {
+        SDL_RenderClear(scon->real_renderer);
+        SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
+        SDL_RenderPresent(scon->real_renderer);
+    }
     sdl2_poll_events(scon);
+    scon->updates = 0;
 }
 
 void sdl2_2d_redraw(struct sdl2_console *scon)
@@ -143,6 +147,12 @@ void sdl2_2d_redraw(struct sdl2_console *scon)
     sdl2_2d_update(&scon->dcl, 0, 0,
                    surface_width(scon->surface),
                    surface_height(scon->surface));
+    if (scon->real_renderer) {
+        SDL_RenderClear(scon->real_renderer);
+        SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
+        SDL_RenderPresent(scon->real_renderer);
+        scon->updates = 0;
+    }
 }
 
 bool sdl2_2d_check_format(DisplayChangeListener *dcl,

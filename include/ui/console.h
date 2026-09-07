@@ -35,8 +35,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(QemuFixedTextConsole, QEMU_FIXED_TEXT_CONSOLE)
 #define QEMU_NUM_LOCK_LED    (1 << 1)
 #define QEMU_CAPS_LOCK_LED   (1 << 2)
 
-/* in ms */
-#define GUI_REFRESH_INTERVAL_DEFAULT    30
+/* in ms (16ms = ~62.5 Hz, full 60 FPS) */
+#define GUI_REFRESH_INTERVAL_DEFAULT    16
 #define GUI_REFRESH_INTERVAL_IDLE     3000
 
 /* Color number is match to standard vga palette */
