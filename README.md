@@ -31,6 +31,10 @@ are Apple M2, TCG-only, TinyCorePure64 x86_64 guest unless noted.
   real-mode / sub-1MB SeaBIOS delay loops and tunes `TIER2_HOT_THRESHOLD` to 50,000,
   eliminating LLVM compile storms and thread contention during OS boot while preserving
   maximum acceleration for sustained workloads.
+- `system/vl.c` — High-performance default I/O options for `-hda`: automatically
+  configures `-hda`/`-hdb`/`-hdc`/`-hdd` with `cache=unsafe,aio=threads` (and `format=raw`
+  for `.img`/`.raw` disk images), eliminating host `fsync` stalls, thread blocking, and
+  probing warnings during OS boot.
 - `include/ui/console.h`, `ui/console.c`, `ui/sdl2.c`, `ui/sdl2-2d.c` — Full 60 FPS
   display pipeline & zero-stutter presentation engine:
   - Native Cocoa priority on macOS matching stock QEMU smoothness by default, with full

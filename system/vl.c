@@ -649,12 +649,45 @@ static int cleanup_add_fd(void *opaque, QemuOpts *opts, Error **errp)
 /***********************************************************/
 /* QEMU Block devices */
 
-#define HD_OPTS "media=disk"
+#define HD_OPTS "media=disk,cache=unsafe,aio=threads"
 #define CDROM_OPTS "media=cdrom"
 #define FD_OPTS ""
 #define PFLASH_OPTS ""
 #define MTD_OPTS ""
 #define SD_OPTS ""
+
+static const char *get_default_hd_opts(const char *filename)
+{
+    static const char opts_raw[] = "media=disk,format=raw,cache=unsafe,aio=threads";
+    static const char opts_gen[] = "media=disk,cache=unsafe,aio=threads";
+
+    if (!filename) {
+        return opts_gen;
+    }
+    if (g_str_has_suffix(filename, ".img") || g_str_has_suffix(filename, ".raw")) {
+        return opts_raw;
+    }
+    if (g_str_has_suffix(filename, ".qcow2") || g_str_has_suffix(filename, ".qcow") ||
+        g_str_has_suffix(filename, ".vmdk") || g_str_has_suffix(filename, ".vdi") ||
+        g_str_has_suffix(filename, ".vhdx") || g_str_has_suffix(filename, ".vhd")) {
+        return opts_gen;
+    }
+    int fd = open(filename, O_RDONLY);
+    if (fd >= 0) {
+        uint8_t magic[4] = {0};
+        ssize_t n = read(fd, magic, sizeof(magic));
+        close(fd);
+        if (n == 4) {
+            if (magic[0] == 'Q' && magic[1] == 'F' && magic[2] == 'I' && magic[3] == 0xfb) {
+                return opts_gen;
+            }
+            if (magic[0] == 'K' && magic[1] == 'D' && magic[2] == 'M' && magic[3] == 'V') {
+                return opts_gen;
+            }
+        }
+    }
+    return opts_raw;
+}
 
 static int drive_init_func(void *opaque, QemuOpts *opts, Error **errp)
 {
@@ -2944,8 +2977,9 @@ void qemu_init(int argc, char **argv)
         if (optind >= argc)
             break;
         if (argv[optind][0] != '-') {
-            loc_set_cmdline(argv, optind, 1);
-            drive_add(IF_DEFAULT, 0, argv[optind++], HD_OPTS);
+            const char *file = argv[optind++];
+            loc_set_cmdline(argv, optind - 1, 1);
+            drive_add(IF_DEFAULT, 0, file, get_default_hd_opts(file));
         } else {
             const QEMUOption *popt;
             QemuOpts *opts;
@@ -2965,7 +2999,7 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_hdc:
             case QEMU_OPTION_hdd:
                 drive_add(IF_DEFAULT, popt->index - QEMU_OPTION_hda, optarg,
-                          HD_OPTS);
+                          get_default_hd_opts(optarg));
                 break;
             case QEMU_OPTION_blockdev:
                 {
