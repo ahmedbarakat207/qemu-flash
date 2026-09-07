@@ -20,7 +20,7 @@
 #include "tcg/tcg.h"
 
 #define TIER2_MAX_TRACE_TBS  16
-#define TIER2_HOT_THRESHOLD  10000
+#define TIER2_HOT_THRESHOLD  50000
 #define TIER2_SAMPLE_MASK    0xff  /* sample 1 in 256 dispatches */
 
 /* Trace of TranslationBlocks forming a closed loop body */

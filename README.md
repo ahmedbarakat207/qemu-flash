@@ -23,14 +23,18 @@ are Apple M2, TCG-only, TinyCorePure64 x86_64 guest unless noted.
   TBs (`!CF_PARALLEL`), mirroring upstream's atomicity elision. Explicit
   guest barriers (`mfence`, locked ops) are unaffected — they bypass this
   helper entirely. Proven 12 → 0 `dmb` on identical TBs.
-- `accel/tcg/tlb-bounds.h` — SoftMMU dynamic TLB scaling: scaled dynamic TLB
-  bounds from 256 to 2048 entries (`CPU_TLB_DYN_MAX_BITS = 11`), eliminating SoftMMU
-  conflict misses on multi-process Linux workloads.
-- `target/i386/tcg/mem_helper.c`, `translate.c` — Hardware-accelerated SIMD `rep stos`
-  and `rep movs`: native `memset` and `memmove` fast-paths for contiguous page memory
-  zeroing and buffer copying with `TLB_NOTDIRTY` tracking and interrupt polling.
+- `accel/tcg/tlb-bounds.h` — SoftMMU dynamic TLB bounds: optimized default and
+  minimum bounds (256/64 entries) to prevent cache thrashing and memset storms during
+  frequent 32-bit CR3 page-table switches (e.g. Windows XP boot), while retaining
+  automatic dynamic expansion under sustained multi-process workloads.
+- `tcg/llvm/tier2.c`, `tier2.h` — Boot churn & transient loop filtering: skips
+  real-mode / sub-1MB SeaBIOS delay loops and tunes `TIER2_HOT_THRESHOLD` to 50,000,
+  eliminating LLVM compile storms and thread contention during OS boot while preserving
+  maximum acceleration for sustained workloads.
 - `include/ui/console.h`, `ui/console.c`, `ui/sdl2.c`, `ui/sdl2-2d.c` — Full 60 FPS
-  SDL display pipeline & zero-stutter presentation engine:
+  display pipeline & zero-stutter presentation engine:
+  - Native Cocoa priority on macOS matching stock QEMU smoothness by default, with full
+    support for `-display sdl` powered by the non-blocking 60 FPS engine.
   - 60 FPS refresh rate: reduced `GUI_REFRESH_INTERVAL_DEFAULT` from 30ms to 16ms.
   - Dirty rect batching: decoupled scanline slice updates from presentation; presents
     once per frame instead of 5–20 blocking presents per refresh.

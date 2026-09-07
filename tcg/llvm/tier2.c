@@ -154,6 +154,15 @@ bool tier2_find_loop_trace(TranslationBlock *header, Tier2Trace *out_trace)
     if (!header) {
         return false;
     }
+#ifndef CONFIG_USER_ONLY
+    /*
+     * Skip BIOS ROM, real-mode IVT/BDA, and early bootloader loops (< 1MB).
+     * Compiling transient BIOS delay/poll loops wastes host LLVM time during OS boot.
+     */
+    if (tb_guest_pc(header) < 0x100000) {
+        return false;
+    }
+#endif
 
     out_trace->header = header;
     out_trace->num_tbs = 0;
