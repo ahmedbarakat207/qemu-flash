@@ -27,8 +27,9 @@ off-line first (see `contrib/llvm-tier2/`).
    trace collection (`tier2_find_loop_trace`), live LLVM ORC JIT trace compiler
    (`libqemu-tier2.dylib`), safe execution bridge via `tcg_qemu_tb_exec`, and
    live invalidation hooks (`tier2_invalidate`). Tested on `dbc-bench`: bit-for-bit
-   checksum match, 3.9x speedup nochain on dispatch-heavy workload
-   (0.46s vs 1.80s stock, 2.0x tier2-attributable).
+    checksum match, 3.83x speedup nochain on dispatch-heavy workload
+    (0.461s vs 1.766s stock; tier2-off control at 0.891s, so ~1.77x of
+    that is tier2-attributable, rest is the base TCG patch set).
 4. DONE: direct SSA IR translation, multi-TB loop fusion, and SIMD lowering:
    - Post-optimization TCG op snapshot capture in `tcg_gen_code`
      (`tier2_capture_tb_ops`, stable `Tier2OpRec` ABI, byte-offset env accesses).
@@ -38,33 +39,40 @@ off-line first (see `contrib/llvm-tier2/`).
      pointer access for identity-mapped memory and stack ops.
    - Vector SIMD transpilation (Phase 4): x86 SSE/AVX vector ops lowered
      directly to ARM64 NEON (`FixedVectorType`, `v0–v31`).
-   - Differential verification: all 18 offline self-tests (`build/tier2-selftest`)
-     passing green.
+    - Differential verification: offline self-tests (`build/tier2-selftest`,
+      traces 1–19) passing green.
 5. DONE: direct block chaining integration (`goto_tb` re-linking, Phase 5):
    - Dynamic jump slot re-linking via dedicated ARM64 native chain stubs (`tb->tier2_stub`).
    - Predecessor TBs jump directly to Tier-2 machine code without returning to
      `cpu_tb_exec()`. Safe W^X transactions and atomic jump resets via `tb_reset_jump()`.
-   - Measured: chained mode accelerated to 0.369s median (1.62x over stock 0.597s).
+    - Measured (Sep 8 2026): chained mode 0.400s median (1.55x over
+      stock 0.619s; tier2-off control 0.566s, so 1.41x is tier2).
 6. DONE: persistent on-disk JIT cache (Phase 2) & async signal profiler (Phase 6):
    - CityHash64 cryptographic caching of native object files (`~/.cache/qemu/tier2/*.o`).
    - Zero-overhead POSIX `SIGPROF` timer sampling at 500 Hz (`QEMU_TIER2_PROF_HZ`).
 7. DONE: High-Level Emulation (HLE) library shims for `linux-user` (Phase 7):
    - Direct host native C library dispatch for math, string, and crypto functions.
 
-## Measured (Apple M2, Sep 2026, LLVM 22.1.6)
+## Measured (Apple M2, Sep 8 2026, LLVM 22.1.6; see top-level README for method)
 
-- `contrib/dbc-bench` live benchmark (5 runs each, checksums bit-for-bit identical):
-  - **Stock chained**: 0.597s median (0.595, 0.598, 0.595, 0.597, 0.597)
-  - **Patched chained (Phase 5 re-linked)**: **0.369s median** (0.437, 0.369, 0.369, 0.368, 0.367) — **1.62x faster**
-  - **Stock unchained (`-d nochain`)**: 1.769s median (1.772, 1.830, 1.769, 1.761, 1.734)
-  - **Patched unchained (`-d nochain`)**: **0.520s median** (0.523, 0.524, 0.520, 0.519, 0.519) — **3.40x faster**
-  - **Guest compute loop cycles**: **87.5M cycles** vs 349.5M baseline (**3.99x reduction**)
-- `build/tier2-bench` (8M-iter loop through real walker): ref=13ms, compile=5ms,
-  exec=9ms, speedup=1.44x, checksum OK (`acc=0x608ca391f307f1`).
-- `build/tier2-selftest`: All 18 tests ALL GREEN (Trace 1–16 + Trace 17 NEON SIMD + Trace 18 HLE shims).
-- `contrib/llvm-tier2/tier2-demo` (model loop, 8M iters): ssa ~80-83ms,
-  env-commit ~78-79ms exec, checksum `0x147ce5ff` OK both modes (~6x over baseline).
-- Offline `op-run` vs `interp.py`: 30/30 fresh randomized ALU runs agree.
+- `contrib/dbc-bench` live benchmark (5 runs each, round-robin, checksums identical):
+  - **Stock chained**: 0.619s median (0.612, 0.617, 0.619, 0.620, 0.622)
+  - **Patched chained (Phase 5 re-linked)**: **0.400s median** (0.391, 0.392, 0.400, 0.402, 0.407) — **1.55x faster**
+  - **Stock unchained (`-d nochain`)**: 1.766s median (1.752, 1.761, 1.766, 1.769, 1.832)
+  - **Patched unchained (`-d nochain`)**: **0.461s median** (0.457, 0.457, 0.461, 0.461, 0.461) — **3.83x faster**
+  - Guest `rdtsc` cycle deltas are not reported: identical work measures
+    305M chained vs 1147M nochain on stock (virtual TSC tracks wall
+    time, not retired work).
+- `build/tier2-bench` (8M-iter loop through real walker): ref=18ms, compile=6ms,
+  exec=10ms best-of-3, speedup=1.80x, checksum OK (`acc=0x608ca391f307f1`).
+- `build/tier2-selftest`: ALL GREEN (traces 1–19: counting loop, op
+  coverage, bail-out negatives, workload-PC fallback, multi-TB fusion,
+  side-exits, helpers, bswap/negsetcond, TLB hit/miss, store paths,
+  prologue tail-call, disk-cache round-trip, native self-loop +
+  safepoint poll, NEON SIMD, HLE shims, full ALU).
+- `contrib/llvm-tier2/tier2-demo` (model loop, 8M iters): ssa 79ms,
+  env-commit 79ms exec, checksum `0x147ce5ff` OK both modes (~6x over baseline).
+- Offline `op-run` vs `interp.py`: 30/30 fresh randomized ALU runs agree (Sep 8).
 
 ## Runtime Architecture
 

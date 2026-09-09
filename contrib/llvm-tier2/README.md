@@ -4,13 +4,13 @@ Answers one question: how much headroom does an LLVM tier-2 backend have
 over TCG on our actual hot loop? (HQEMU's idea, re-implemented against
 current LLVM instead of porting its decade-old TCG/LLVM glue.)
 
-## Result (Apple M2, 8M loop iterations, re-measured Sep 2026, LLVM 22.1.6)
+## Result (Apple M2, 8M loop iterations, re-measured Sep 8 2026, LLVM 22.1.6)
 
 | implementation | exec time | vs TCG |
 |---|---|---|
 | TCG (this repo, patched; prior measurement, same machine class) | ~510ms | 1x |
-| tier2-demo ssa (trace-style) | ~80-83ms | ~6x |
-| tier2-demo env (TCG-style commits) | ~78-79ms | ~6.5x |
+| tier2-demo ssa (trace-style) | ~79ms | ~6x |
+| tier2-demo env (TCG-style commits) | ~79ms | ~6x |
 | native clang -O2 (ceiling) | 77-96ms | ~6x |
 
 Checksum `0x147ce5ff` matches the TCG run in both modes or the model is
@@ -46,16 +46,18 @@ scalar loop:
 
 | implementation | exec time | vs clang scalar |
 |---|---|---|
-| clang -O2 scalar reference | ~9-10ms | 1x |
-| op-walker compiled trace | ~10ms (best of 3) | ~0.9-1.0x |
-| walker compile tax | ~4ms warm / ~71ms cold first process | -- |
+| clang -O2 scalar reference | ~18ms | 1x |
+| op-walker compiled trace | ~10ms (best of 3) | ~1.8x |
+| walker compile tax | ~6ms warm | -- |
 
-Checksum matches the C++ reference or the bench fails. ~1.0x is the
-honest result here: the loop carries a true data dependency (`acc`),
-so neither clang nor the walker can vectorize it -- both run at the
-native scalar ceiling. The tier-2 dividend on real guest code comes
-from deleting TCG dispatch and env-commit traffic around such loops,
-not from beating clang at straight-line scalar code.
+Checksum matches the C++ reference or the bench fails (Sep 8 2026:
+`acc=0x608ca391f307f1`). Caveat: the scalar reference moved from
+~9-10ms (Sep 7) to ~18ms while the walker stayed at ~10ms, so the
+1.8x ratio is host-state-sensitive noise, not a walker-vs-clang
+verdict — do not quote it as a general claim. The tier-2 dividend on
+real guest code comes from deleting TCG dispatch and env-commit
+traffic around such loops, not from beating clang at straight-line
+scalar code.
 
 ## Why not port HQEMU's backend
 
@@ -81,7 +83,7 @@ counts; stores are read-modify-write).
 Verification: `interp.py` is an independent interpreter of the same
 record format. 12/12 parseable hot TBs agree, plus 144 randomized
 differential runs with edge values (0/1/2^31-1/2^31/2^32-1/2^63-1/2^63/
-2^64-1), all green (harness re-verified Sep 2026: 30/30 fresh
+2^64-1), all green (harness re-verified Sep 8 2026: 30/30 fresh
 randomized ALU runs agree after the LLVM 22 rebuild).
 
     ./build/qemu-system-x86_64 ... -d op -D ops.log -dfilter <range>
