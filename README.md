@@ -44,7 +44,9 @@ are Apple M2, TCG-only, TinyCorePure64 x86_64 guest unless noted.
     once per frame instead of 5–20 blocking presents per refresh.
   - Non-blocking OpenGL renderer on macOS: drops presentation time from 7.92ms
     (Metal blocking vsync) down to 0.43ms (asynchronous buffer swap), freeing the
-    main thread and eliminating vCPU starvation.
+    main thread and eliminating vCPU starvation. (Prior direct measurement;
+    mechanism — `opengl` hint + vsync 0 + swap interval 0 — verified in
+    `ui/sdl2.c`, but the millisecond figures were not re-timed in this pass.)
   - Guaranteed inter-frame spacing in `ui/console.c` preventing 1ms timer starvation bursts.
   - Autonomous guest rendering detection: guest updates keep refresh active at 16ms.
 - `tcg/llvm/` — in-tree Tier-2 JIT (Phases 1–7): Phase 5 chain-graph dynamic re-linking
@@ -86,7 +88,7 @@ OS boot to shell (TinyCorePure64):
 | **patched, Round-Robin (`-accel tcg,thread=single`)** | **4.0s** (4 runs: 3.88, 3.88, 4.08, 4.09; stock RR: 4.9s) |
 
 Paired result, robust to the noise: in every one of 15 interleaved
-same-flags boot rounds, patched beat stock (typical gap 0.5–1.5s).
+same-flags boot rounds, patched beat stock (typical gap 0.4–1.4s on cool runs).
 The Sep 6 `20.1s` stock-defaults figure does **not** reproduce under
 controlled interleaved runs — it was most likely a loaded-host /
 cold-start artifact (our own matrix shows +10–20s under sustained
@@ -195,8 +197,8 @@ SeaBIOS + workload; guest checksums (`sum=0x0000000000001768` mem,
 | patched, tier2 off, nochain | 0.891s | 0.883, 0.888, 0.891, 0.936, 0.942 | 1.98x faster |
 
 Note: the Sep 7 revision claimed 0.201s / 0.296s for patched tier2-on.
-That does not reproduce on current HEAD (stable 0.39–0.41s / 0.46s
-across 10+ runs in two harnesses, tier2 verified engaged via
+That does not reproduce on current HEAD (stable 0.39–0.41s chained /
+0.46–0.55s nochain across 10 runs each in two harnesses, tier2 verified engaged via
 `QEMU_TIER2_DEBUG=1`); the old figures are replaced, not averaged.
 Guest `rdtsc` cycle deltas are deliberately not reported: identical
 work measures 305M chained vs 1147M nochain on stock, i.e. the
